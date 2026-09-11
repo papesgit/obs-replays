@@ -86,6 +86,40 @@ bool ReplaySession::addEvent(TimelineUs inUs, TimelineUs outUs, const QString &l
 	return saveManifest(error);
 }
 
+bool ReplaySession::updateEvent(qsizetype index, TimelineUs inUs, TimelineUs outUs, const QString &label,
+			QString *error)
+{
+	if (index < 0 || index >= replayEvents.size() || inUs < 0 || outUs <= inUs ||
+	    outUs > latestTimelineUs()) {
+		*error = "The event range is outside the recorded replay timeline.";
+		return false;
+	}
+
+	ReplayEvent &event = replayEvents[index];
+	const ReplayEvent original = event;
+	event.inUs = inUs;
+	event.outUs = outUs;
+	event.label = label;
+	if (saveManifest(error))
+		return true;
+	event = original;
+	return false;
+}
+
+bool ReplaySession::removeEvent(qsizetype index, QString *error)
+{
+	if (index < 0 || index >= replayEvents.size()) {
+		*error = "The replay event no longer exists.";
+		return false;
+	}
+
+	const ReplayEvent removed = replayEvents.takeAt(index);
+	if (saveManifest(error))
+		return true;
+	replayEvents.insert(index, removed);
+	return false;
+}
+
 bool ReplaySession::isActive() const
 {
 	return active;

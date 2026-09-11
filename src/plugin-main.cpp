@@ -33,16 +33,22 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QHeaderView>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QListWidget>
 #include <QLineEdit>
+#include <QMouseEvent>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
+#include <QSplitter>
+#include <QSplitterHandle>
 #include <QStorageInfo>
+#include <QStringList>
+#include <QTableWidget>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -52,8 +58,63 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <memory>
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
+#include <functional>
 
 namespace {
+
+class EventTableSplitter final : public QSplitter {
+private:
+	class Handle final : public QSplitterHandle {
+	public:
+		explicit Handle(EventTableSplitter *splitter)
+			: QSplitterHandle(Qt::Vertical, splitter), splitter(splitter)
+		{
+		}
+
+	protected:
+		void mousePressEvent(QMouseEvent *event) override
+		{
+			start_y = event->globalPosition().y();
+			start_table_height = splitter->widget(0)->height();
+			event->accept();
+		}
+
+		void mouseMoveEvent(QMouseEvent *event) override
+		{
+			splitter->resizeTable(start_table_height +
+				static_cast<int>(event->globalPosition().y() - start_y));
+			event->accept();
+		}
+
+	private:
+		EventTableSplitter *splitter;
+		qreal start_y = 0.0;
+		int start_table_height = 0;
+	};
+
+public:
+	explicit EventTableSplitter(QWidget *parent) : QSplitter(Qt::Vertical, parent) {}
+
+	void resizeTable(int height)
+	{
+		constexpr int minimum_table_height = 80;
+		const int desired_height = qMax(minimum_table_height, height);
+		QWidget *table = widget(0);
+		QWidget *controls = widget(1);
+		if (!table || !controls)
+			return;
+		table->setMinimumHeight(desired_height);
+		setMinimumHeight(desired_height + controls->minimumSizeHint().height() + handleWidth());
+		setSizes({desired_height, controls->height()});
+		updateGeometry();
+		if (parentWidget())
+			parentWidget()->updateGeometry();
+	}
+
+protected:
+	QSplitterHandle *createHandle() override { return new Handle(this); }
+};
 
 constexpr const char *dock_id = "obs-replays.dock";
 constexpr const char *dock_title = "Replays";
@@ -74,18 +135,17 @@ QComboBox *between_events_transition_selector = nullptr;
 QSpinBox *between_events_fade_duration_selector = nullptr;
 QSlider *playback_speed_selector = nullptr;
 QLabel *playback_speed_value = nullptr;
-QSpinBox *pre_roll_seconds_selector = nullptr;
-QSpinBox *post_roll_seconds_selector = nullptr;
-QLabel *settings_status = nullptr;
 QLabel *playout_status = nullptr;
 QLabel *recording_status = nullptr;
 QLabel *storage_status = nullptr;
 QPushButton *start_recording_button = nullptr;
 QPushButton *stop_recording_button = nullptr;
-QPushButton *mark_event_button = nullptr;
+QVector<QPushButton *> mark_event_buttons;
+QPushButton *delete_events_button = nullptr;
 QPushButton *play_events_button = nullptr;
-QListWidget *events_list = nullptr;
+QTableWidget *events_table = nullptr;
 QTimer *recording_timer = nullptr;
+QTimer *settings_save_timer = nullptr;
 // OBS can destroy frontend dock widgets before calling obs_module_unload().
 // Keep shutdown cleanup independent from those Qt objects.
 bool module_unloading = false;
@@ -95,13 +155,6 @@ std::unique_ptr<obs_replays::SegmentWriter> segment_writer;
 uint64_t recording_stop_requested_ns = 0;
 bool recording_force_stop_issued = false;
 
-struct PendingReplayEvent {
-	obs_replays::TimelineUs inUs = 0;
-	obs_replays::TimelineUs outUs = 0;
-	QString label;
-};
-
-QVector<PendingReplayEvent> pending_events;
 obs_source_t *previous_program_scene = nullptr;
 obs_source_t *previous_transition = nullptr;
 obs_source_t *active_replay_scene = nullptr;
@@ -134,6 +187,7 @@ void media_started_callback(void *, calldata_t *);
 void play_selected_replay_events();
 void outro_transition_stop_callback(void *, calldata_t *);
 void advance_replay_playout();
+bool parse_timeline(const QString &text, obs_replays::TimelineUs *timestamp_us);
 
 void update_playout_button()
 {
@@ -331,12 +385,78 @@ void update_storage_status()
 	const qint64 recordable_seconds =
 		bits_per_second > 0.0 ? (qint64)((recordable_bytes * 8.0) / bits_per_second) : 0;
 	const double free_gib = free_bytes / (1024.0 * 1024.0 * 1024.0);
-	const QString message =
-		QString("Available: %1 GiB. Estimated recording time: %2 (5 GiB safety reserve, %3 Mb/s video + %4 kb/s audio).")
-			.arg(QString::number(free_gib, 'f', 1), format_duration(recordable_seconds))
-			.arg(video_bitrate_selector->value())
-			.arg(audio_bitrate_selector->value());
+	const QString message = QString("Available: %1 GiB. Estimated recording time: %2.")
+				    .arg(QString::number(free_gib, 'f', 1), format_duration(recordable_seconds));
 	storage_status->setText(message);
+}
+
+QString format_recording_duration(obs_replays::TimelineUs timestamp_us)
+{
+	const qint64 total_seconds = timestamp_us / 1000000;
+	const qint64 hours = total_seconds / 3600;
+	const qint64 minutes = (total_seconds / 60) % 60;
+	const qint64 seconds = total_seconds % 60;
+	return QString("%1:%2:%3")
+		.arg(hours, 2, 10, QLatin1Char('0'))
+		.arg(minutes, 2, 10, QLatin1Char('0'))
+		.arg(seconds, 2, 10, QLatin1Char('0'));
+}
+
+void clear_replay_folder()
+{
+	if (!replay_folder_selector || replay_folder_selector->text().isEmpty()) {
+		QMessageBox::information(replay_dock, "Clear replay folder", "Choose a replay folder first.");
+		return;
+	}
+	if (replay_session && replay_session->isActive()) {
+		QMessageBox::information(replay_dock, "Clear replay folder",
+				       "Stop the active replay recording session before clearing its folder.");
+		return;
+	}
+
+	const QDir replay_folder(replay_folder_selector->text());
+	if (!replay_folder.exists()) {
+		QMessageBox::information(replay_dock, "Clear replay folder", "The selected replay folder is not available.");
+		return;
+	}
+
+	QFileInfoList sessions;
+	for (const QFileInfo &entry : replay_folder.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+		if (entry.fileName().startsWith("OBS-Replay-"))
+			sessions.append(entry);
+	}
+	if (sessions.isEmpty()) {
+		QMessageBox::information(replay_dock, "Clear replay folder", "There are no OBS Replays sessions to remove.");
+		return;
+	}
+
+	const QString prompt = QString("Permanently delete %1 replay session%2 from this folder?\n\n"
+					 "This cannot be undone.")
+				       .arg(sessions.size())
+				       .arg(sessions.size() == 1 ? "" : "s");
+	if (QMessageBox::warning(replay_dock, "Clear replay folder", prompt,
+				 QMessageBox::Cancel | QMessageBox::Yes, QMessageBox::Cancel) != QMessageBox::Yes)
+		return;
+
+	int removed = 0;
+	QStringList failures;
+	for (const QFileInfo &session : sessions) {
+		if (QDir(session.absoluteFilePath()).removeRecursively())
+			++removed;
+		else
+			failures.append(session.fileName());
+	}
+	update_storage_status();
+	if (failures.isEmpty()) {
+		QMessageBox::information(replay_dock, "Clear replay folder",
+				       QString("Removed %1 replay session%2.").arg(removed).arg(removed == 1 ? "" : "s"));
+	} else {
+		QMessageBox::warning(replay_dock, "Clear replay folder",
+				     QString("Removed %1 session%2, but could not remove: %3")
+					     .arg(removed)
+					     .arg(removed == 1 ? "" : "s")
+					     .arg(failures.join(", ")));
+	}
 }
 
 obs_data_t *get_scene_collection_settings(obs_data_t *settings, bool create)
@@ -377,10 +497,8 @@ void load_settings()
 
 	obs_data_t *collection_settings = get_scene_collection_settings(settings, false);
 	obs_data_release(settings);
-	if (!collection_settings) {
-		settings_status->setText("No saved settings for this scene collection.");
+	if (!collection_settings)
 		return;
-	}
 
 	const QSignalBlocker source_blocker(source_selector);
 	const QSignalBlocker replay_folder_blocker(replay_folder_selector);
@@ -425,21 +543,10 @@ void load_settings()
 		static_cast<int>(obs_data_get_int(collection_settings, "between_events_fade_duration_ms"));
 	if (fade_duration > 0)
 		between_events_fade_duration_selector->setValue(fade_duration);
-	const int playback_speed = static_cast<int>(obs_data_get_int(collection_settings, "playback_speed_percent"));
-	playback_speed_selector->setValue(playback_speed >= 10 && playback_speed <= 100 ? playback_speed : 100);
+	playback_speed_selector->setValue(100);
 	update_playback_speed(playback_speed_selector->value());
 
-	const int pre_roll_seconds =
-		(int)obs_data_get_int(collection_settings, "pre_roll_seconds");
-	const int post_roll_seconds =
-		(int)obs_data_get_int(collection_settings, "post_roll_seconds");
-	if (pre_roll_seconds >= 0)
-		pre_roll_seconds_selector->setValue(pre_roll_seconds);
-	if (post_roll_seconds >= 0)
-		post_roll_seconds_selector->setValue(post_roll_seconds);
-
 	obs_data_release(collection_settings);
-	settings_status->setText("Settings loaded for the current scene collection.");
 	update_storage_status();
 }
 
@@ -447,7 +554,7 @@ void save_settings()
 {
 	char *path = obs_module_config_path(settings_filename);
 	if (!path) {
-		settings_status->setText("Could not find the OBS plugin configuration folder.");
+		obs_log(LOG_WARNING, "OBS Replays: could not find the settings folder.");
 		return;
 	}
 
@@ -458,7 +565,7 @@ void save_settings()
 	if (!collection_settings) {
 		obs_data_release(settings);
 		bfree(path);
-		settings_status->setText("Could not identify the current scene collection.");
+		obs_log(LOG_WARNING, "OBS Replays: could not identify the current scene collection.");
 		return;
 	}
 
@@ -478,16 +585,30 @@ void save_settings()
 			    between_events_transition_selector->currentData().toString().toUtf8().constData());
 	obs_data_set_int(collection_settings, "between_events_fade_duration_ms",
 			 between_events_fade_duration_selector->value());
-	obs_data_set_int(collection_settings, "playback_speed_percent", playback_speed_percent());
-	obs_data_set_int(collection_settings, "pre_roll_seconds", pre_roll_seconds_selector->value());
-	obs_data_set_int(collection_settings, "post_roll_seconds", post_roll_seconds_selector->value());
+	obs_data_erase(collection_settings, "playback_speed_percent");
+	obs_data_erase(collection_settings, "pre_roll_seconds");
+	obs_data_erase(collection_settings, "post_roll_seconds");
 
 	obs_data_release(collection_settings);
 	const bool saved = obs_data_save_json_safe(settings, path, "tmp", "bak");
 	obs_data_release(settings);
 	bfree(path);
-	settings_status->setText(saved ? "Settings saved for this scene collection."
-					 : "Could not save settings.");
+	if (!saved)
+		obs_log(LOG_WARNING, "OBS Replays: could not save settings.");
+}
+
+void schedule_settings_save()
+{
+	if (!module_unloading && settings_save_timer)
+		settings_save_timer->start(350);
+}
+
+void flush_scheduled_settings_save()
+{
+	if (settings_save_timer && settings_save_timer->isActive()) {
+		settings_save_timer->stop();
+		save_settings();
+	}
 }
 
 void clear_playout_state()
@@ -545,38 +666,88 @@ void set_recording_controls(bool recording)
 		start_recording_button->setEnabled(!recording);
 	if (stop_recording_button)
 		stop_recording_button->setEnabled(recording);
-	if (mark_event_button)
-		mark_event_button->setEnabled(recording);
+	for (QPushButton *button : mark_event_buttons)
+		button->setEnabled(recording);
 }
 
 void refresh_events_list()
 {
-	if (!events_list)
+	if (!events_table)
 		return;
 
-	events_list->clear();
+	const QSignalBlocker blocker(events_table);
+	events_table->setRowCount(0);
 	if (replay_session) {
 		for (qsizetype index = 0; index < replay_session->events().size(); ++index) {
 			const obs_replays::ReplayEvent &event = replay_session->events().at(index);
-			const QString label = event.label.isEmpty() ? "Replay event" : event.label;
-			events_list->addItem(QString("%1  %2 → %3")
-						 .arg(label)
-						 .arg(format_timeline(event.inUs))
-						 .arg(format_timeline(event.outUs)));
-			events_list->item(events_list->count() - 1)
-				->setData(Qt::UserRole, static_cast<int>(index));
+			const int row = events_table->rowCount();
+			events_table->insertRow(row);
+			auto *number = new QTableWidgetItem(QString::number(index + 1));
+			number->setData(Qt::UserRole, static_cast<int>(index));
+			number->setFlags(number->flags() & ~Qt::ItemIsEditable);
+			events_table->setItem(row, 0, number);
+			events_table->setItem(row, 1, new QTableWidgetItem(format_timeline(event.inUs)));
+			events_table->setItem(row, 2, new QTableWidgetItem(format_timeline(event.outUs)));
+			events_table->setItem(row, 3, new QTableWidgetItem(event.label));
 		}
 	}
-	for (const PendingReplayEvent &event : pending_events) {
-		events_list->addItem(
-			QString("Pending  %1 → %2").arg(format_timeline(event.inUs),
-								       format_timeline(event.outUs)));
-	}
-	if (events_list->count() == 0)
-		events_list->addItem("No replay events yet");
 }
 
-void mark_replay_event()
+void update_replay_event_from_table(int row, int column)
+{
+	if (!replay_session || column == 0 || row < 0)
+		return;
+	QTableWidgetItem *number = events_table->item(row, 0);
+	QTableWidgetItem *in = events_table->item(row, 1);
+	QTableWidgetItem *out = events_table->item(row, 2);
+	QTableWidgetItem *label = events_table->item(row, 3);
+	if (!number || !in || !out || !label)
+		return;
+
+	bool index_ok = false;
+	const int event_index = number->data(Qt::UserRole).toInt(&index_ok);
+	obs_replays::TimelineUs in_us = 0;
+	obs_replays::TimelineUs out_us = 0;
+	if (!index_ok || !parse_timeline(in->text(), &in_us) || !parse_timeline(out->text(), &out_us)) {
+		playout_status->setText("Enter event times as HH:MM:SS.mmm (or seconds).");
+		refresh_events_list();
+		return;
+	}
+
+	QString error;
+	if (!replay_session->updateEvent(event_index, in_us, out_us, label->text(), &error))
+		playout_status->setText(error);
+	else
+		playout_status->setText("Replay event updated.");
+	refresh_events_list();
+}
+
+void delete_selected_replay_events()
+{
+	if (!replay_session || !events_table)
+		return;
+	QVector<int> indices;
+	for (const QModelIndex &model_index : events_table->selectionModel()->selectedRows()) {
+		QTableWidgetItem *number = events_table->item(model_index.row(), 0);
+		bool ok = false;
+		const int event_index = number ? number->data(Qt::UserRole).toInt(&ok) : -1;
+		if (ok)
+			indices.append(event_index);
+	}
+	if (indices.isEmpty())
+		return;
+	std::sort(indices.begin(), indices.end(), std::greater<int>());
+	for (const int event_index : indices) {
+		QString error;
+		if (!replay_session->removeEvent(event_index, &error)) {
+			playout_status->setText(error);
+			break;
+		}
+	}
+	refresh_events_list();
+}
+
+void mark_replay_event(int seconds_back)
 {
 	if (!replay_session || !source_capture) {
 		recording_status->setText("Start recording before marking a replay event.");
@@ -585,16 +756,20 @@ void mark_replay_event()
 
 	const obs_replays::TimelineUs now =
 		static_cast<obs_replays::TimelineUs>(source_capture->timelineUs());
-	const obs_replays::TimelineUs pre_roll = pre_roll_seconds_selector->value() * 1000000LL;
-	const obs_replays::TimelineUs post_roll = post_roll_seconds_selector->value() * 1000000LL;
-	const int event_number = static_cast<int>(replay_session->events().size() +
-								 pending_events.size()) +
-				 1;
-	pending_events.append({qMax<obs_replays::TimelineUs>(0, now - pre_roll), now + post_roll,
-				       QString("Event %1").arg(event_number)});
+	replay_session->updateLiveTimeline(now);
+	const obs_replays::TimelineUs in_us = qMax<obs_replays::TimelineUs>(0, now - seconds_back * 1000000LL);
+	if (now <= in_us) {
+		recording_status->setText("Wait for replay capture to collect enough video before marking an event.");
+		return;
+	}
+	const int event_number = static_cast<int>(replay_session->events().size()) + 1;
+	QString error;
+	if (!replay_session->addEvent(in_us, now, QString("Event %1").arg(event_number), &error)) {
+		recording_status->setText(error);
+		return;
+	}
 	refresh_events_list();
-	recording_status->setText(post_roll > 0 ? "Replay event marked; waiting for post-roll."
-						     : "Replay event marked.");
+	recording_status->setText(QString("Replay event marked: last %1 seconds.").arg(seconds_back));
 }
 
 void update_recording_session()
@@ -605,22 +780,6 @@ void update_recording_session()
 	const obs_replays::TimelineUs timeline_us =
 		static_cast<obs_replays::TimelineUs>(source_capture->timelineUs());
 	replay_session->updateLiveTimeline(timeline_us);
-	for (qsizetype i = 0; i < pending_events.size();) {
-		const PendingReplayEvent &event = pending_events.at(i);
-		if (event.outUs > replay_session->latestTimelineUs()) {
-			++i;
-			continue;
-		}
-
-		QString error;
-		if (!replay_session->addEvent(event.inUs, event.outUs, event.label, &error)) {
-			recording_status->setText(error);
-			++i;
-			continue;
-		}
-		pending_events.removeAt(i);
-		refresh_events_list();
-	}
 	if (segment_writer->hasStopped()) {
 		QString error;
 		replay_session->stop(&error);
@@ -645,10 +804,10 @@ void update_recording_session()
 		return;
 	}
 
-	recording_status->setText(QString("Recording: %1 video frames, %2 source audio frames, timeline %3.")
+	recording_status->setText(QString("Recording: %1 frames, %2 audio samples, %3")
 					 .arg(source_capture->capturedVideoFrames())
 					 .arg(source_capture->capturedAudioFrames())
-					 .arg(format_duration(timeline_us / 1000000)));
+					 .arg(format_recording_duration(timeline_us)));
 }
 
 void start_recording_session()
@@ -705,7 +864,6 @@ void start_recording_session()
 	replay_session = std::move(session);
 	source_capture = std::move(capture);
 	segment_writer = std::move(writer);
-	pending_events.clear();
 	recording_stop_requested_ns = 0;
 	recording_force_stop_issued = false;
 	refresh_events_list();
@@ -773,7 +931,6 @@ void close_recording_session_for_shutdown()
 		obs_log(LOG_INFO, "OBS Replays: replay recording session finalized for shutdown.");
 
 	replay_session.reset();
-	pending_events.clear();
 	set_recording_controls(false);
 }
 
@@ -985,6 +1142,40 @@ void start_active_replay_event(void *data)
 	}
 }
 
+bool parse_timeline(const QString &text, obs_replays::TimelineUs *timestamp_us)
+{
+	const QString value = text.trimmed();
+	if (value.isEmpty())
+		return false;
+
+	const QStringList fields = value.split(':');
+	double seconds = 0.0;
+	if (fields.size() == 1) {
+		bool ok = false;
+		seconds = fields.at(0).toDouble(&ok);
+		if (!ok)
+			return false;
+	} else if (fields.size() == 2 || fields.size() == 3) {
+		bool hours_ok = true;
+		bool minutes_ok = true;
+		const qint64 hours = fields.size() == 3 ? fields.at(0).toLongLong(&hours_ok) : 0;
+		const qint64 minutes = fields.at(fields.size() - 2).toLongLong(&minutes_ok);
+		bool seconds_ok = false;
+		const double final_seconds = fields.last().toDouble(&seconds_ok);
+		if (!hours_ok || !minutes_ok || !seconds_ok || hours < 0 || minutes < 0 ||
+		    minutes >= 60 || final_seconds < 0.0 || final_seconds >= 60.0)
+			return false;
+		seconds = hours * 3600.0 + minutes * 60.0 + final_seconds;
+	} else {
+		return false;
+	}
+
+	if (!std::isfinite(seconds) || seconds < 0.0)
+		return false;
+	*timestamp_us = static_cast<obs_replays::TimelineUs>(std::llround(seconds * 1000000.0));
+	return true;
+}
+
 void media_started_callback(void *, calldata_t *)
 {
 	const auto token = reinterpret_cast<void *>(static_cast<uintptr_t>(playback_generation));
@@ -1053,18 +1244,19 @@ void advance_replay_playout()
 
 void play_selected_replay_events()
 {
-	if (!replay_session || events_list->selectedItems().isEmpty()) {
-		playout_status->setText("Select one or more finalized replay events first.");
+	if (!replay_session || !events_table || events_table->selectionModel()->selectedRows().isEmpty()) {
+		playout_status->setText("Select one or more replay events first.");
 		return;
 	}
 
 	QVector<ReplayPlayoutItem> queue;
 	QVector<int> selected_event_indices;
-	for (QListWidgetItem *selected_item : events_list->selectedItems()) {
+	for (const QModelIndex &model_index : events_table->selectionModel()->selectedRows()) {
+		QTableWidgetItem *selected_item = events_table->item(model_index.row(), 0);
 		bool has_event_index = false;
-		const int event_index = selected_item->data(Qt::UserRole).toInt(&has_event_index);
+		const int event_index = selected_item ? selected_item->data(Qt::UserRole).toInt(&has_event_index) : -1;
 		if (!has_event_index || event_index < 0 || event_index >= replay_session->events().size()) {
-			playout_status->setText("Pending events cannot be played until their post-roll is recorded.");
+			playout_status->setText("The selected replay event is no longer available.");
 			return;
 		}
 		selected_event_indices.append(event_index);
@@ -1102,11 +1294,14 @@ void play_selected_replay_events()
 void frontend_event(enum obs_frontend_event event, void *)
 {
 	if (event == OBS_FRONTEND_EVENT_EXIT) {
+		flush_scheduled_settings_save();
 		close_recording_session_for_shutdown();
 		return;
 	}
 
 	if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED) {
+		if (settings_save_timer)
+			settings_save_timer->stop();
 		clear_playout_state();
 		refresh_source_selector();
 		refresh_playout_selectors();
@@ -1128,7 +1323,10 @@ QWidget *create_replay_dock()
 {
 	auto *dock = new QScrollArea();
 	dock->setWidgetResizable(true);
+	dock->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	dock->setMinimumWidth(360);
 	auto *content = new QWidget(dock);
+	content->setMinimumWidth(360);
 	auto *layout = new QVBoxLayout(content);
 	layout->setContentsMargins(8, 8, 8, 8);
 
@@ -1177,6 +1375,10 @@ QWidget *create_replay_dock()
 	storage_status = new QLabel(capture_group);
 	storage_status->setWordWrap(true);
 	capture_form->addRow("Storage", storage_status);
+	auto *clear_replay_folder_button = new QPushButton("Clear replay folder", capture_group);
+	QObject::connect(clear_replay_folder_button, &QPushButton::clicked,
+			 []() { clear_replay_folder(); });
+	capture_form->addRow(QString(), clear_replay_folder_button);
 	QObject::connect(replay_folder_selector, &QLineEdit::textChanged,
 			 [](const QString &) { update_storage_status(); });
 	QObject::connect(video_bitrate_selector,
@@ -1190,22 +1392,16 @@ QWidget *create_replay_dock()
 	QObject::connect(storage_timer, &QTimer::timeout, []() { update_storage_status(); });
 	storage_timer->start();
 
-	pre_roll_seconds_selector = new QSpinBox(capture_group);
-	pre_roll_seconds_selector->setRange(0, 60);
-	pre_roll_seconds_selector->setValue(5);
-	pre_roll_seconds_selector->setSuffix(" s");
-	capture_form->addRow("Default event pre-roll", pre_roll_seconds_selector);
-
-	post_roll_seconds_selector = new QSpinBox(capture_group);
-	post_roll_seconds_selector->setRange(0, 60);
-	post_roll_seconds_selector->setValue(5);
-	post_roll_seconds_selector->setSuffix(" s");
-	capture_form->addRow("Default event post-roll", post_roll_seconds_selector);
-
-	auto *refresh_sources = new QPushButton("Refresh sources", capture_group);
+	auto *refresh_sources_row = new QWidget(capture_group);
+	auto *refresh_sources_layout = new QHBoxLayout(refresh_sources_row);
+	refresh_sources_layout->setContentsMargins(0, 0, 0, 0);
+	auto *refresh_sources = new QPushButton("Refresh sources", refresh_sources_row);
 	QObject::connect(refresh_sources, &QPushButton::clicked,
 			 []() { refresh_source_selector(); });
-	capture_form->addRow(QString(), refresh_sources);
+	refresh_sources_layout->addStretch();
+	refresh_sources_layout->addWidget(refresh_sources);
+	refresh_sources_layout->addStretch();
+	capture_form->addRow(refresh_sources_row);
 	layout->addWidget(capture_group);
 	QObject::connect(capture_toggle, &QToolButton::toggled, [capture_group, capture_toggle](bool expanded) {
 		capture_group->setVisible(expanded);
@@ -1237,12 +1433,18 @@ QWidget *create_replay_dock()
 	between_events_fade_duration_selector->setValue(150);
 	between_events_fade_duration_selector->setSuffix(" ms");
 	playout_form->addRow("Event fade duration", between_events_fade_duration_selector);
-	auto *refresh_playout = new QPushButton("Refresh scenes and transitions", playout_group);
+	auto *refresh_playout_row = new QWidget(playout_group);
+	auto *refresh_playout_layout = new QHBoxLayout(refresh_playout_row);
+	refresh_playout_layout->setContentsMargins(0, 0, 0, 0);
+	auto *refresh_playout = new QPushButton("Refresh scenes/transitions", refresh_playout_row);
 	QObject::connect(refresh_playout, &QPushButton::clicked,
 			 []() {
 				 refresh_playout_selectors();
 			 });
-	playout_form->addRow(QString(), refresh_playout);
+	refresh_playout_layout->addStretch();
+	refresh_playout_layout->addWidget(refresh_playout);
+	refresh_playout_layout->addStretch();
+	playout_form->addRow(refresh_playout_row);
 	layout->addWidget(playout_group);
 	QObject::connect(playout_toggle, &QToolButton::toggled, [playout_group, playout_toggle](bool expanded) {
 		playout_group->setVisible(expanded);
@@ -1307,33 +1509,88 @@ QWidget *create_replay_dock()
 	events_layout->addWidget(speed_row);
 	QObject::connect(playback_speed_selector, &QSlider::valueChanged,
 			 [](int percent) { update_playback_speed(percent); });
-	events_list = new QListWidget(events_group);
-	events_list->setSelectionMode(QAbstractItemView::ExtendedSelection);
-	events_layout->addWidget(events_list);
-	mark_event_button = new QPushButton("Mark event", events_group);
-	mark_event_button->setEnabled(false);
-	QObject::connect(mark_event_button, &QPushButton::clicked, []() { mark_replay_event(); });
-	events_layout->addWidget(mark_event_button);
+	auto *events_splitter = new EventTableSplitter(events_group);
+	events_table = new QTableWidget(events_splitter);
+	events_table->setColumnCount(4);
+	events_table->setHorizontalHeaderLabels({"#", "In", "Out", "Label"});
+	events_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+	events_table->setSelectionMode(QAbstractItemView::ExtendedSelection);
+	events_table->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed |
+					      QAbstractItemView::SelectedClicked);
+	events_table->verticalHeader()->setVisible(false);
+	events_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+	events_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+	events_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+	events_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+	// Keep enough room for the header and one row, while leaving the splitter
+	// free to make this table substantially smaller when dock space is needed.
+	events_table->setMinimumHeight(80);
+	QObject::connect(events_table, &QTableWidget::cellChanged,
+			 [](int row, int column) { update_replay_event_from_table(row, column); });
+	events_splitter->addWidget(events_table);
+
+	auto *event_controls = new QWidget(events_splitter);
+	auto *event_controls_layout = new QVBoxLayout(event_controls);
+	event_controls_layout->setContentsMargins(0, 0, 0, 0);
+	auto *mark_buttons_row = new QWidget(event_controls);
+	auto *mark_buttons_layout = new QHBoxLayout(mark_buttons_row);
+	mark_buttons_layout->setContentsMargins(0, 0, 0, 0);
+	for (const int seconds_back : {10, 5, 3, 2, 1}) {
+		auto *button = new QPushButton(QString("-%1").arg(seconds_back), mark_buttons_row);
+		button->setEnabled(false);
+		button->setToolTip(QString("Mark an event from %1 seconds ago until now.").arg(seconds_back));
+		QObject::connect(button, &QPushButton::clicked,
+				 [seconds_back]() { mark_replay_event(seconds_back); });
+		mark_event_buttons.append(button);
+		mark_buttons_layout->addWidget(button);
+	}
+	event_controls_layout->addWidget(mark_buttons_row);
+	delete_events_button = new QPushButton("Delete selected events", event_controls);
+	QObject::connect(delete_events_button, &QPushButton::clicked,
+			 []() { delete_selected_replay_events(); });
+	event_controls_layout->addWidget(delete_events_button);
+	events_splitter->addWidget(event_controls);
+	events_splitter->setCollapsible(0, false);
+	events_splitter->setCollapsible(1, false);
+	events_splitter->setStretchFactor(0, 1);
+	events_splitter->setSizes({260, 70});
+	events_layout->addWidget(events_splitter, 1);
 	event_playout_timer = new QTimer(events_group);
 	event_playout_timer->setInterval(20);
 	QObject::connect(event_playout_timer, &QTimer::timeout,
 			 []() { update_event_playout_timer(); });
-	layout->addWidget(events_group);
+	// Let the event table own any spare dock height so its splitter can grow
+	// upward as well as shrink. A trailing layout stretch would consume it.
+	layout->addWidget(events_group, 1);
 
-	auto *save_button = new QPushButton("Save settings", content);
-	QObject::connect(save_button, &QPushButton::clicked, []() { save_settings(); });
-	layout->addWidget(save_button);
-	settings_status = new QLabel(content);
-	settings_status->setWordWrap(true);
-	layout->addWidget(settings_status);
-
-	layout->addStretch();
 	refresh_source_selector();
 	refresh_playout_selectors();
 	load_settings();
 	update_storage_status();
 	refresh_events_list();
 	update_playout_button();
+	settings_save_timer = new QTimer(dock);
+	settings_save_timer->setSingleShot(true);
+	QObject::connect(settings_save_timer, &QTimer::timeout, []() { save_settings(); });
+	QObject::connect(source_selector, &QComboBox::currentTextChanged,
+			 [](const QString &) { schedule_settings_save(); });
+	QObject::connect(replay_folder_selector, &QLineEdit::textChanged,
+			 [](const QString &) { schedule_settings_save(); });
+	auto save_spinbox = [](QSpinBox *selector) {
+		QObject::connect(selector, QOverload<int>::of(&QSpinBox::valueChanged),
+				 [](int) { schedule_settings_save(); });
+	};
+	save_spinbox(video_bitrate_selector);
+	save_spinbox(audio_bitrate_selector);
+	save_spinbox(between_events_fade_duration_selector);
+	QObject::connect(replay_scene_selector, &QComboBox::currentTextChanged,
+			 [](const QString &) { schedule_settings_save(); });
+	QObject::connect(intro_transition_selector, &QComboBox::currentTextChanged,
+			 [](const QString &) { schedule_settings_save(); });
+	QObject::connect(outro_transition_selector, &QComboBox::currentTextChanged,
+			 [](const QString &) { schedule_settings_save(); });
+	QObject::connect(between_events_transition_selector, QOverload<int>::of(&QComboBox::currentIndexChanged),
+			 [](int) { schedule_settings_save(); });
 	dock->setWidget(content);
 	return dock;
 }
@@ -1370,6 +1627,7 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	flush_scheduled_settings_save();
 	module_unloading = true;
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
 	close_recording_session_for_shutdown();
@@ -1388,18 +1646,17 @@ void obs_module_unload(void)
 	between_events_fade_duration_selector = nullptr;
 	playback_speed_selector = nullptr;
 	playback_speed_value = nullptr;
-	pre_roll_seconds_selector = nullptr;
-	post_roll_seconds_selector = nullptr;
-	settings_status = nullptr;
 	playout_status = nullptr;
 	recording_status = nullptr;
 	storage_status = nullptr;
 	start_recording_button = nullptr;
 	stop_recording_button = nullptr;
-	mark_event_button = nullptr;
+	mark_event_buttons.clear();
+	delete_events_button = nullptr;
 	play_events_button = nullptr;
-	events_list = nullptr;
+	events_table = nullptr;
 	recording_timer = nullptr;
+	settings_save_timer = nullptr;
 	event_playout_timer = nullptr;
 	obs_log(LOG_INFO, "OBS Replays unloaded");
 }

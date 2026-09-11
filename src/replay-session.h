@@ -33,6 +33,9 @@ public:
 
 	void updateLiveTimeline(TimelineUs timelineUs);
 	bool addEvent(TimelineUs inUs, TimelineUs outUs, const QString &label, QString *error);
+	bool updateEvent(qsizetype index, TimelineUs inUs, TimelineUs outUs, const QString &label,
+			 QString *error);
+	bool removeEvent(qsizetype index, QString *error);
 
 	bool isActive() const;
 	TimelineUs latestTimelineUs() const;
