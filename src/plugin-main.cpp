@@ -81,6 +81,9 @@ QPushButton *mark_event_button = nullptr;
 QPushButton *play_events_button = nullptr;
 QListWidget *events_list = nullptr;
 QTimer *recording_timer = nullptr;
+// OBS can destroy frontend dock widgets before calling obs_module_unload().
+// Keep shutdown cleanup independent from those Qt objects.
+bool module_unloading = false;
 std::unique_ptr<obs_replays::ReplaySession> replay_session;
 std::unique_ptr<obs_replays::SourceCapture> source_capture;
 std::unique_ptr<obs_replays::SegmentWriter> segment_writer;
@@ -126,7 +129,7 @@ void outro_transition_stop_callback(void *, calldata_t *);
 
 void update_playout_button()
 {
-	if (!play_events_button)
+	if (module_unloading || !play_events_button)
 		return;
 	if (outro_cleanup_pending) {
 		play_events_button->setText("Ending replay…");
@@ -406,7 +409,7 @@ void save_settings()
 void clear_playout_state()
 {
 	++playback_generation;
-	if (event_playout_timer)
+	if (!module_unloading && event_playout_timer)
 		event_playout_timer->stop();
 	if (active_replay_playback_source) {
 		if (auto *channel = obs_replays::ReplayChannelSource::fromSource(active_replay_playback_source))
@@ -450,9 +453,14 @@ obs_source_t *source_from_selector(QComboBox *selector)
 
 void set_recording_controls(bool recording)
 {
-	start_recording_button->setEnabled(!recording);
-	stop_recording_button->setEnabled(recording);
-	mark_event_button->setEnabled(recording);
+	if (module_unloading)
+		return;
+	if (start_recording_button)
+		start_recording_button->setEnabled(!recording);
+	if (stop_recording_button)
+		stop_recording_button->setEnabled(recording);
+	if (mark_event_button)
+		mark_event_button->setEnabled(recording);
 }
 
 void refresh_events_list()
@@ -638,7 +646,7 @@ void close_recording_session_for_shutdown()
 	if (!replay_session || !replay_session->isActive())
 		return;
 
-	if (recording_timer)
+	if (!module_unloading && recording_timer)
 		recording_timer->stop();
 
 	bool writer_stopped = true;
@@ -1198,6 +1206,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 bool obs_module_load(void)
 {
+	module_unloading = false;
 	obs_replays::ReplayChannelSource::registerSourceTypes();
 	char *config_dir = obs_module_config_path(nullptr);
 	if (config_dir) {
@@ -1222,6 +1231,7 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	module_unloading = true;
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
 	close_recording_session_for_shutdown();
 	clear_playout_state();
@@ -1241,8 +1251,12 @@ void obs_module_unload(void)
 	playout_status = nullptr;
 	recording_status = nullptr;
 	storage_status = nullptr;
+	start_recording_button = nullptr;
+	stop_recording_button = nullptr;
 	mark_event_button = nullptr;
 	play_events_button = nullptr;
 	events_list = nullptr;
+	recording_timer = nullptr;
+	event_playout_timer = nullptr;
 	obs_log(LOG_INFO, "OBS Replays unloaded");
 }
