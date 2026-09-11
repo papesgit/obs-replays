@@ -25,6 +25,7 @@ public:
 	bool start(video_t *video, audio_t *audio, const QString &path, int videoBitrateMbps,
 		   int audioBitrateKbps, int segmentDurationSeconds, QString *error);
 	void stop();
+	void forceStop();
 	void release();
 
 	bool isActive() const;

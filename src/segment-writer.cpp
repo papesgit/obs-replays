@@ -101,6 +101,12 @@ void SegmentWriter::stop()
 		obs_output_stop(output);
 }
 
+void SegmentWriter::forceStop()
+{
+	if (output)
+		obs_output_force_stop(output);
+}
+
 void SegmentWriter::release()
 {
 	if (output) {

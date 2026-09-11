@@ -85,6 +85,8 @@ std::unique_ptr<obs_replays::ReplaySession> replay_session;
 std::unique_ptr<obs_replays::SourceCapture> source_capture;
 std::unique_ptr<obs_replays::SegmentWriter> segment_writer;
 QString active_segment_path;
+uint64_t recording_stop_requested_ns = 0;
+bool recording_force_stop_issued = false;
 
 struct PendingReplayEvent {
 	obs_replays::TimelineUs inUs = 0;
@@ -569,11 +571,22 @@ void update_recording_session()
 								 : error);
 		segment_writer.reset();
 		source_capture.reset();
+		recording_stop_requested_ns = 0;
+		recording_force_stop_issued = false;
 		return;
 	}
 
-	recording_status->setText(QString("Recording: %1 video frames, timeline %2.")
+	if (recording_stop_requested_ns && !recording_force_stop_issued &&
+	    os_gettime_ns() - recording_stop_requested_ns >= 5000000000ULL) {
+		recording_force_stop_issued = true;
+		segment_writer->forceStop();
+		recording_status->setText("Recording finalization timed out; forcing output shutdown…");
+		return;
+	}
+
+	recording_status->setText(QString("Recording: %1 video frames, %2 source audio frames, timeline %3.")
 					 .arg(source_capture->capturedVideoFrames())
+					 .arg(source_capture->capturedAudioFrames())
 					 .arg(format_duration(timeline_us / 1000000)));
 }
 
@@ -623,7 +636,7 @@ void start_recording_session()
 	auto writer = std::make_unique<obs_replays::SegmentWriter>();
 	const QString segment_path =
 		QDir(session->sessionDirectory()).filePath("segments/replay.mkv");
-	if (!writer->start(capture->videoOutput(), obs_get_audio(), segment_path,
+	if (!writer->start(capture->videoOutput(), capture->audioOutput(), segment_path,
 			   configuration.videoBitrateMbps, configuration.audioBitrateKbps,
 			   configuration.segmentDurationSeconds, &error)) {
 		capture->stop();
@@ -644,6 +657,8 @@ void start_recording_session()
 		return;
 	}
 	pending_events.clear();
+	recording_stop_requested_ns = 0;
+	recording_force_stop_issued = false;
 	refresh_events_list();
 	set_recording_controls(true);
 	recording_timer->start();
@@ -658,6 +673,8 @@ void stop_recording_session()
 	}
 	stop_recording_button->setEnabled(false);
 	pending_live_playout = false;
+	recording_stop_requested_ns = os_gettime_ns();
+	recording_force_stop_issued = false;
 	recording_status->setText("Finalizing replay MKV segment…");
 	segment_writer->stop();
 }
@@ -676,6 +693,14 @@ void close_recording_session_for_shutdown()
 		const uint64_t deadline = os_gettime_ns() + 5000000000ULL;
 		while (!segment_writer->hasStopped() && os_gettime_ns() < deadline)
 			os_sleep_ms(10);
+		if (!segment_writer->hasStopped()) {
+			obs_log(LOG_WARNING,
+				"OBS Replays: forcing replay output shutdown after finalization timeout.");
+			segment_writer->forceStop();
+			const uint64_t forced_deadline = os_gettime_ns() + 1000000000ULL;
+			while (!segment_writer->hasStopped() && os_gettime_ns() < forced_deadline)
+				os_sleep_ms(10);
+		}
 		writer_stopped = segment_writer->hasStopped();
 		if (writer_stopped && source_capture) {
 			replay_session->updateLiveTimeline(source_capture->timelineUs());
