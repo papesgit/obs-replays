@@ -38,16 +38,47 @@ set(OBS_REPLAYS_FFMPEG_RUNTIME_DLLS
     "${OBS_REPLAYS_DEPS_DIR}/bin/zlib.dll"
 )
 
+# The shared playback helper supports speed only at creation time. Generate a
+# locally patched decode unit which delegates timestamp scaling to our runtime
+# controller, allowing continuous speed changes without re-basing timestamps.
+set(OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/obs-replays-media-playback")
+file(MAKE_DIRECTORY "${OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR}")
+file(READ "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/decode.c"
+     OBS_REPLAYS_DECODE_SOURCE)
+set(OBS_REPLAYS_STATIC_SPEED_SCALING [=[
+		if (d->m->speed != 100) {
+			d->frame_pts = av_rescale_q(d->frame_pts, (AVRational){1, d->m->speed}, (AVRational){1, 100});
+			duration = av_rescale_q(duration, (AVRational){1, d->m->speed}, (AVRational){1, 100});
+		}
+]=])
+set(OBS_REPLAYS_RUNTIME_SPEED_SCALING [=[
+		obs_replays_scale_decode_timestamp(d, &d->frame_pts, &duration);
+]=])
+string(FIND "${OBS_REPLAYS_DECODE_SOURCE}" "${OBS_REPLAYS_STATIC_SPEED_SCALING}"
+            OBS_REPLAYS_SPEED_SCALING_OFFSET)
+if(OBS_REPLAYS_SPEED_SCALING_OFFSET EQUAL -1)
+  message(FATAL_ERROR "Could not apply OBS Replays' media playback speed patch")
+endif()
+string(REPLACE "${OBS_REPLAYS_STATIC_SPEED_SCALING}"
+               "${OBS_REPLAYS_RUNTIME_SPEED_SCALING}"
+               OBS_REPLAYS_DECODE_SOURCE "${OBS_REPLAYS_DECODE_SOURCE}")
+file(WRITE "${OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR}/decode.c"
+     "#include \"media-playback-runtime.h\"\n${OBS_REPLAYS_DECODE_SOURCE}")
+
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/cache.c"
-          "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/decode.c"
+          "${OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR}/decode.c"
           "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/media-playback.c"
           "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/media.c"
 )
 target_include_directories(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}" "${OBS_REPLAYS_DEPS_DIR}/include"
+  PRIVATE "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}"
+          "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback"
+          "${OBS_REPLAYS_DEPS_DIR}/include"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 target_link_libraries(
   ${CMAKE_PROJECT_NAME}
@@ -81,6 +112,7 @@ target_sources(
   PRIVATE src/plugin-main.cpp src/replay-session.cpp src/replay-session.h src/source-capture.cpp
           src/source-capture.h src/segment-writer.cpp src/segment-writer.h
           src/replay-channel-source.cpp src/replay-channel-source.h
+          src/media-playback-runtime.c src/media-playback-runtime.h
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

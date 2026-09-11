@@ -4,6 +4,8 @@
 #include <util/platform.h>
 extern "C" {
 #include <media-playback/media-playback.h>
+void media_playback_set_speed(media_playback_t *playback, int speed);
+void media_playback_release_speed_state(media_playback_t *playback);
 }
 
 #include <algorithm>
@@ -35,6 +37,12 @@ uint32_t video_plane_rows(enum video_format format, uint32_t height, size_t plan
 ReplayChannelSource::ReplayChannelSource(obs_source_t *source, ReplayChannel channel)
 	: source(source), replayChannel(channel)
 {
+	// The media decoder already supplies a shared, rate-mapped clock for video
+	// and audio.  OBS's usual asynchronous audio smoother interprets a live
+	// rate adjustment as timestamp jitter and can accumulate audio behind the
+	// video, so this source owns that synchronisation directly.
+	obs_source_set_async_unbuffered(source, true);
+	obs_source_set_async_decoupled(source, true);
 	for (int index = 0; index < 2; ++index)
 		playerCallbacks[index] = {this, index};
 }
@@ -88,6 +96,7 @@ void ReplayChannelSource::reset()
 	for (media_playback_t *decoder : decoders) {
 		if (decoder) {
 			media_playback_stop(decoder);
+			media_playback_release_speed_state(decoder);
 			media_playback_destroy(decoder);
 		}
 	}
@@ -146,6 +155,30 @@ bool ReplayChannelSource::takeCued(int fadeDurationMilliseconds, QString *error)
 	return true;
 }
 
+void ReplayChannelSource::setPlaybackSpeed(int percent)
+{
+	percent = std::clamp(percent, 10, 100);
+	std::array<media_playback_t *, 2> decoders = {};
+	bool applySpeed = false;
+	{
+		std::lock_guard lock(mutex);
+		if (playbackSpeedPercent != percent) {
+			pendingAudio[0].clear();
+			pendingAudio[1].clear();
+			playbackSpeedPercent = percent;
+			applySpeed = true;
+		}
+		for (int index = 0; index < 2; ++index)
+			decoders[index] = players[index].decoder;
+	}
+	if (!applySpeed)
+		return;
+	for (media_playback_t *decoder : decoders) {
+		if (decoder)
+			media_playback_set_speed(decoder, percent);
+	}
+}
+
 bool ReplayChannelSource::loadSlot(int playerIndex, const QString &path, qint64 positionMilliseconds,
 				   PlayerState state, QString *error)
 {
@@ -166,6 +199,10 @@ bool ReplayChannelSource::loadSlot(int playerIndex, const QString &path, qint64 
 	info.a_cb = audioFrame;
 	info.stop_cb = playbackStopped;
 	info.path = utf8Path.constData();
+	{
+		std::lock_guard lock(mutex);
+		info.speed = playbackSpeedPercent;
+	}
 	info.is_local_file = true;
 	info.request_preload = true;
 	media_playback_t *decoder = media_playback_create(&info);
@@ -193,7 +230,11 @@ void ReplayChannelSource::releaseSlot(int playerIndex)
 		cachedVideo[playerIndex] = {};
 		pendingAudio[playerIndex].clear();
 	}
-	if (decoder) { media_playback_stop(decoder); media_playback_destroy(decoder); }
+	if (decoder) {
+		media_playback_stop(decoder);
+		media_playback_release_speed_state(decoder);
+		media_playback_destroy(decoder);
+	}
 }
 
 bool ReplayChannelSource::cacheVideoFrame(CachedVideoFrame &destination,
@@ -412,9 +453,10 @@ void ReplayChannelSource::outputTransitionAudio(int playerIndex, obs_source_audi
 			outgoing.pop_front();
 			incoming.pop_front();
 			outputMixed = true;
-		} else if (playerIndex == activePlayer) {
+		} else {
 			mixed = std::move(incoming.front());
 			incoming.pop_front();
+			outgoing.pop_front();
 			outputMixed = true;
 		}
 	}

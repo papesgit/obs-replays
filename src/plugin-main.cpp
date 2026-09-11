@@ -40,6 +40,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QSpinBox>
 #include <QStorageInfo>
 #include <QTimer>
@@ -71,6 +72,8 @@ QComboBox *intro_transition_selector = nullptr;
 QComboBox *outro_transition_selector = nullptr;
 QComboBox *between_events_transition_selector = nullptr;
 QSpinBox *between_events_fade_duration_selector = nullptr;
+QSlider *playback_speed_selector = nullptr;
+QLabel *playback_speed_value = nullptr;
 QSpinBox *pre_roll_seconds_selector = nullptr;
 QSpinBox *post_roll_seconds_selector = nullptr;
 QLabel *settings_status = nullptr;
@@ -106,6 +109,8 @@ obs_source_t *active_replay_playback_source = nullptr;
 int previous_transition_duration = 0;
 bool replay_scene_change_in_progress = false;
 QTimer *event_playout_timer = nullptr;
+double event_playout_remaining_media_milliseconds = 0.0;
+uint64_t event_playout_last_tick_ns = 0;
 
 struct ReplayPlayoutItem {
 	QString segmentPath;
@@ -128,6 +133,7 @@ uint64_t outro_transition_wait_generation = 0;
 void media_started_callback(void *, calldata_t *);
 void play_selected_replay_events();
 void outro_transition_stop_callback(void *, calldata_t *);
+void advance_replay_playout();
 
 void update_playout_button()
 {
@@ -151,6 +157,53 @@ qint64 between_events_fade_duration_milliseconds()
 	    between_events_transition_selector->currentData().toString() != "fade")
 		return 0;
 	return between_events_fade_duration_selector->value();
+}
+
+int playback_speed_percent()
+{
+	return playback_speed_selector ? playback_speed_selector->value() : 100;
+}
+
+void update_playback_speed(int percent)
+{
+	if (playback_speed_value)
+		playback_speed_value->setText(QString("%1%").arg(percent));
+	if (active_replay_playback_source) {
+		if (auto *channel = obs_replays::ReplayChannelSource::fromSource(
+			    active_replay_playback_source))
+			channel->setPlaybackSpeed(percent);
+	}
+}
+
+void update_event_playout_timer()
+{
+	if (!event_playout_timer) {
+		advance_replay_playout();
+		return;
+	}
+	if (event_playout_remaining_media_milliseconds <= 0.0) {
+		if (event_playout_timer)
+			event_playout_timer->stop();
+		advance_replay_playout();
+		return;
+	}
+
+	const uint64_t now = os_gettime_ns();
+	if (event_playout_last_tick_ns) {
+		const double elapsed_milliseconds = (now - event_playout_last_tick_ns) / 1000000.0;
+		event_playout_remaining_media_milliseconds -=
+			elapsed_milliseconds * playback_speed_percent() / 100.0;
+	}
+	event_playout_last_tick_ns = now;
+	const bool has_next_event = replay_playout_index >= 0 &&
+		replay_playout_index + 1 < replay_playout_queue.size();
+	const double transition_lead_media_milliseconds = has_next_event
+		? between_events_fade_duration_milliseconds() * playback_speed_percent() / 100.0
+		: 0.0;
+	if (event_playout_remaining_media_milliseconds <= transition_lead_media_milliseconds) {
+		event_playout_timer->stop();
+		advance_replay_playout();
+	}
 }
 
 qint64 stinger_transition_point_milliseconds(obs_source_t *transition)
@@ -338,6 +391,7 @@ void load_settings()
 	const QSignalBlocker outro_blocker(outro_transition_selector);
 	const QSignalBlocker between_events_blocker(between_events_transition_selector);
 	const QSignalBlocker fade_duration_blocker(between_events_fade_duration_selector);
+	const QSignalBlocker playback_speed_blocker(playback_speed_selector);
 
 	auto select_saved_value = [](QComboBox *selector, const char *value) {
 		const int index = selector->findText(QString::fromUtf8(value));
@@ -371,6 +425,9 @@ void load_settings()
 		static_cast<int>(obs_data_get_int(collection_settings, "between_events_fade_duration_ms"));
 	if (fade_duration > 0)
 		between_events_fade_duration_selector->setValue(fade_duration);
+	const int playback_speed = static_cast<int>(obs_data_get_int(collection_settings, "playback_speed_percent"));
+	playback_speed_selector->setValue(playback_speed >= 10 && playback_speed <= 100 ? playback_speed : 100);
+	update_playback_speed(playback_speed_selector->value());
 
 	const int pre_roll_seconds =
 		(int)obs_data_get_int(collection_settings, "pre_roll_seconds");
@@ -421,6 +478,7 @@ void save_settings()
 			    between_events_transition_selector->currentData().toString().toUtf8().constData());
 	obs_data_set_int(collection_settings, "between_events_fade_duration_ms",
 			 between_events_fade_duration_selector->value());
+	obs_data_set_int(collection_settings, "playback_speed_percent", playback_speed_percent());
 	obs_data_set_int(collection_settings, "pre_roll_seconds", pre_roll_seconds_selector->value());
 	obs_data_set_int(collection_settings, "post_roll_seconds", post_roll_seconds_selector->value());
 
@@ -437,6 +495,8 @@ void clear_playout_state()
 	++playback_generation;
 	if (!module_unloading && event_playout_timer)
 		event_playout_timer->stop();
+	event_playout_remaining_media_milliseconds = 0.0;
+	event_playout_last_tick_ns = 0;
 	if (active_replay_playback_source) {
 		if (auto *channel = obs_replays::ReplayChannelSource::fromSource(active_replay_playback_source))
 			channel->reset();
@@ -885,13 +945,14 @@ void start_active_replay_event(void *data)
 	auto *channel = obs_replays::ReplayChannelSource::fromSource(active_replay_playback_source);
 	if (!channel)
 		return;
-	qint64 timer_duration = item.durationMilliseconds;
-	if (replay_playout_index + 1 < replay_playout_queue.size())
-		timer_duration = std::max<qint64>(0, timer_duration - between_events_fade_duration_milliseconds());
+	event_playout_remaining_media_milliseconds = item.durationMilliseconds;
 	if (replay_playout_index == 0)
-		timer_duration += first_event_intro_lead_milliseconds;
+		event_playout_remaining_media_milliseconds += first_event_intro_lead_milliseconds;
+	event_playout_remaining_media_milliseconds =
+		std::max(0.0, event_playout_remaining_media_milliseconds);
+	event_playout_last_tick_ns = os_gettime_ns();
 	if (event_playout_timer)
-		event_playout_timer->start(static_cast<int>(std::max<qint64>(0, timer_duration)));
+		event_playout_timer->start(20);
 	playout_status->setText(QString("Playing %1 (%2 of %3).").arg(item.label)
 				 .arg(replay_playout_index + 1)
 				 .arg(replay_playout_queue.size()));
@@ -1030,8 +1091,10 @@ void play_selected_replay_events()
 	replay_playout_queue = queue;
 	replay_playout_index = -1;
 	++playback_generation;
-	if (auto *channel = obs_replays::ReplayChannelSource::fromSource(active_replay_playback_source))
+	if (auto *channel = obs_replays::ReplayChannelSource::fromSource(active_replay_playback_source)) {
 		channel->reset();
+		channel->setPlaybackSpeed(playback_speed_percent());
+	}
 	if (!play_next_replay_event(&error))
 		playout_status->setText(error);
 }
@@ -1174,7 +1237,6 @@ QWidget *create_replay_dock()
 	between_events_fade_duration_selector->setValue(150);
 	between_events_fade_duration_selector->setSuffix(" ms");
 	playout_form->addRow("Event fade duration", between_events_fade_duration_selector);
-
 	auto *refresh_playout = new QPushButton("Refresh scenes and transitions", playout_group);
 	QObject::connect(refresh_playout, &QPushButton::clicked,
 			 []() {
@@ -1229,6 +1291,22 @@ QWidget *create_replay_dock()
 		play_selected_replay_events();
 	});
 	events_layout->addWidget(play_events_button);
+	auto *speed_row = new QWidget(events_group);
+	auto *speed_layout = new QHBoxLayout(speed_row);
+	speed_layout->setContentsMargins(0, 0, 0, 0);
+	auto *speed_label = new QLabel("Playback speed", speed_row);
+	playback_speed_selector = new QSlider(Qt::Horizontal, speed_row);
+	playback_speed_selector->setRange(10, 100);
+	playback_speed_selector->setValue(100);
+	playback_speed_selector->setTickInterval(10);
+	playback_speed_selector->setTickPosition(QSlider::TicksBelow);
+	playback_speed_value = new QLabel("100%", speed_row);
+	speed_layout->addWidget(speed_label);
+	speed_layout->addWidget(playback_speed_selector);
+	speed_layout->addWidget(playback_speed_value);
+	events_layout->addWidget(speed_row);
+	QObject::connect(playback_speed_selector, &QSlider::valueChanged,
+			 [](int percent) { update_playback_speed(percent); });
 	events_list = new QListWidget(events_group);
 	events_list->setSelectionMode(QAbstractItemView::ExtendedSelection);
 	events_layout->addWidget(events_list);
@@ -1237,8 +1315,9 @@ QWidget *create_replay_dock()
 	QObject::connect(mark_event_button, &QPushButton::clicked, []() { mark_replay_event(); });
 	events_layout->addWidget(mark_event_button);
 	event_playout_timer = new QTimer(events_group);
-	event_playout_timer->setSingleShot(true);
-	QObject::connect(event_playout_timer, &QTimer::timeout, []() { advance_replay_playout(); });
+	event_playout_timer->setInterval(20);
+	QObject::connect(event_playout_timer, &QTimer::timeout,
+			 []() { update_event_playout_timer(); });
 	layout->addWidget(events_group);
 
 	auto *save_button = new QPushButton("Save settings", content);
@@ -1307,6 +1386,8 @@ void obs_module_unload(void)
 	outro_transition_selector = nullptr;
 	between_events_transition_selector = nullptr;
 	between_events_fade_duration_selector = nullptr;
+	playback_speed_selector = nullptr;
+	playback_speed_value = nullptr;
 	pre_roll_seconds_selector = nullptr;
 	post_roll_seconds_selector = nullptr;
 	settings_status = nullptr;

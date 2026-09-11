@@ -27,6 +27,7 @@ public:
 	bool load(const QString &path, qint64 positionMilliseconds, QString *error);
 	bool cueNext(const QString &path, qint64 positionMilliseconds, QString *error);
 	bool takeCued(int fadeDurationMilliseconds, QString *error);
+	void setPlaybackSpeed(int percent);
 
 private:
 	enum class PlayerState {
@@ -97,6 +98,7 @@ private:
 	std::array<std::deque<CachedAudioFrame>, 2> pendingAudio;
 	std::mutex mutex;
 	int activePlayer = 0;
+	int playbackSpeedPercent = 100;
 	int fadingOutPlayer = -1;
 	uint64_t fadeStartNs = 0;
 	uint64_t fadeDurationNs = 0;
