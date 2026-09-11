@@ -2,7 +2,6 @@
 
 #include <atomic>
 
-#include <QMutex>
 #include <QString>
 
 struct obs_encoder;
@@ -23,25 +22,20 @@ public:
 	~SegmentWriter();
 
 	bool start(video_t *video, audio_t *audio, const QString &path, int videoBitrateMbps,
-		   int audioBitrateKbps, int segmentDurationSeconds, QString *error);
+		   int audioBitrateKbps, QString *error);
 	void stop();
 	void forceStop();
 	void release();
 
 	bool isActive() const;
 	bool hasStopped() const;
-	bool requestSplit(QString *error);
-	QString latestSegmentPath() const;
 
 private:
-	static void onFileChanged(void *param, calldata_t *data);
 	static void onStopped(void *param, calldata_t *data);
 
 	obs_encoder_t *videoEncoder = nullptr;
 	obs_encoder_t *audioEncoder = nullptr;
 	obs_output_t *output = nullptr;
-	mutable QMutex mutex;
-	QString latestPath;
 	std::atomic<bool> stopped = false;
 };
 

@@ -84,7 +84,6 @@ QTimer *recording_timer = nullptr;
 std::unique_ptr<obs_replays::ReplaySession> replay_session;
 std::unique_ptr<obs_replays::SourceCapture> source_capture;
 std::unique_ptr<obs_replays::SegmentWriter> segment_writer;
-QString active_segment_path;
 uint64_t recording_stop_requested_ns = 0;
 bool recording_force_stop_issued = false;
 
@@ -113,7 +112,6 @@ struct ReplayPlayoutItem {
 QVector<ReplayPlayoutItem> replay_playout_queue;
 int replay_playout_index = -1;
 qint64 pending_seek_milliseconds = -1;
-bool pending_live_playout = false;
 bool awaiting_event_start = false;
 uint64_t playback_generation = 0;
 qint64 intro_transition_point_milliseconds = 0;
@@ -436,7 +434,6 @@ void clear_playout_state()
 	replay_playout_queue.clear();
 	replay_playout_index = -1;
 	pending_seek_milliseconds = -1;
-	pending_live_playout = false;
 	awaiting_event_start = false;
 	intro_transition_point_milliseconds = 0;
 	first_event_intro_lead_milliseconds = 0;
@@ -506,18 +503,6 @@ void mark_replay_event()
 						     : "Replay event marked.");
 }
 
-void finalize_active_segment()
-{
-	if (active_segment_path.isEmpty() || !replay_session || !replay_session->isActive())
-		return;
-
-	QString error;
-	const QFileInfo segment_file(active_segment_path);
-	replay_session->finalizeCurrentSegment(source_capture->timelineUs(),
-					      segment_file.exists() ? segment_file.size() : 0, &error);
-	active_segment_path.clear();
-}
-
 void update_recording_session()
 {
 	if (!replay_session || !source_capture || !segment_writer)
@@ -542,25 +527,7 @@ void update_recording_session()
 		pending_events.removeAt(i);
 		refresh_events_list();
 	}
-	const QString latest_segment = segment_writer->latestSegmentPath();
-	if (!latest_segment.isEmpty() && latest_segment != active_segment_path) {
-		finalize_active_segment();
-		QString error;
-		const QString relative_path =
-			QDir(replay_session->sessionDirectory()).relativeFilePath(latest_segment);
-		if (replay_session->beginSegment(relative_path, timeline_us, &error)) {
-			active_segment_path = latest_segment;
-			if (pending_live_playout) {
-				pending_live_playout = false;
-				playout_status->setText("Live replay segment finalized; preparing selected events.");
-				QTimer::singleShot(0, []() { play_selected_replay_events(); });
-			}
-		} else
-			recording_status->setText(error);
-	}
-
 	if (segment_writer->hasStopped()) {
-		finalize_active_segment();
 		QString error;
 		replay_session->stop(&error);
 		segment_writer->release();
@@ -596,7 +563,6 @@ void start_recording_session()
 		recording_status->setText("A replay recording session is already active.");
 		return;
 	}
-	pending_live_playout = false;
 
 	obs_source_t *source = source_from_selector(source_selector);
 	if (!source || replay_folder_selector->text().isEmpty()) {
@@ -634,11 +600,8 @@ void start_recording_session()
 	obs_source_release(source);
 
 	auto writer = std::make_unique<obs_replays::SegmentWriter>();
-	const QString segment_path =
-		QDir(session->sessionDirectory()).filePath("segments/replay.mkv");
-	if (!writer->start(capture->videoOutput(), capture->audioOutput(), segment_path,
-			   configuration.videoBitrateMbps, configuration.audioBitrateKbps,
-			   configuration.segmentDurationSeconds, &error)) {
+	if (!writer->start(capture->videoOutput(), capture->audioOutput(), session->recordingPath(),
+			   configuration.videoBitrateMbps, configuration.audioBitrateKbps, &error)) {
 		capture->stop();
 		session->stop(&error);
 		recording_status->setText(error);
@@ -648,14 +611,6 @@ void start_recording_session()
 	replay_session = std::move(session);
 	source_capture = std::move(capture);
 	segment_writer = std::move(writer);
-	active_segment_path = segment_writer->latestSegmentPath();
-	const QString initial_relative_path =
-		QDir(replay_session->sessionDirectory()).relativeFilePath(active_segment_path);
-	if (!replay_session->beginSegment(initial_relative_path, 0, &error)) {
-		segment_writer->stop();
-		recording_status->setText(error);
-		return;
-	}
 	pending_events.clear();
 	recording_stop_requested_ns = 0;
 	recording_force_stop_issued = false;
@@ -672,10 +627,9 @@ void stop_recording_session()
 		return;
 	}
 	stop_recording_button->setEnabled(false);
-	pending_live_playout = false;
 	recording_stop_requested_ns = os_gettime_ns();
 	recording_force_stop_issued = false;
-	recording_status->setText("Finalizing replay MKV segment…");
+	recording_status->setText("Finalizing replay MP4 recording…");
 	segment_writer->stop();
 }
 
@@ -704,7 +658,6 @@ void close_recording_session_for_shutdown()
 		writer_stopped = segment_writer->hasStopped();
 		if (writer_stopped && source_capture) {
 			replay_session->updateLiveTimeline(source_capture->timelineUs());
-			finalize_active_segment();
 		} else if (!writer_stopped) {
 			obs_log(LOG_WARNING,
 				"OBS Replays: timed out waiting for the recording output to finalize during shutdown.");
@@ -726,7 +679,6 @@ void close_recording_session_for_shutdown()
 		obs_log(LOG_INFO, "OBS Replays: replay recording session finalized for shutdown.");
 
 	replay_session.reset();
-	active_segment_path.clear();
 	pending_events.clear();
 	set_recording_controls(false);
 }
@@ -988,7 +940,6 @@ void play_selected_replay_events()
 	}
 
 	QVector<ReplayPlayoutItem> queue;
-	bool requires_live_split = false;
 	QVector<int> selected_event_indices;
 	for (QListWidgetItem *selected_item : events_list->selectedItems()) {
 		bool has_event_index = false;
@@ -1000,41 +951,16 @@ void play_selected_replay_events()
 		selected_event_indices.append(event_index);
 	}
 	std::sort(selected_event_indices.begin(), selected_event_indices.end());
+	const QString recording_path = replay_session->recordingPath();
+	if (!QFileInfo::exists(recording_path)) {
+		playout_status->setText("The replay recording file is not available yet.");
+		return;
+	}
 	for (const int event_index : selected_event_indices) {
 		const obs_replays::ReplayEvent &event = replay_session->events().at(event_index);
-		const obs_replays::ReplaySegment *segment = nullptr;
-		for (const obs_replays::ReplaySegment &candidate : replay_session->recordedSegments()) {
-			if (candidate.finalized && event.inUs >= candidate.startUs && event.outUs <= candidate.endUs) {
-				segment = &candidate;
-				break;
-			}
-		}
-		if (!segment) {
-			if (replay_session->isActive() && segment_writer && segment_writer->isActive()) {
-				requires_live_split = true;
-				continue;
-			}
-			playout_status->setText("This event crosses replay segments. Multi-segment playout is the next controller milestone.");
-			return;
-		}
-		const QString path = QDir(replay_session->sessionDirectory()).filePath(segment->relativePath);
-		if (!QFileInfo::exists(path)) {
-			playout_status->setText("A segment file for the selected event is missing.");
-			return;
-		}
-		queue.append({path, (event.inUs - segment->startUs) / 1000,
+		queue.append({recording_path, event.inUs / 1000,
 			      (event.outUs - event.inUs) / 1000,
 			      event.label.isEmpty() ? "Replay event" : event.label});
-	}
-	if (requires_live_split) {
-		QString error;
-		if (!segment_writer->requestSplit(&error)) {
-			playout_status->setText(error);
-			return;
-		}
-		pending_live_playout = true;
-		playout_status->setText("Finalizing the live replay segment at the next keyframe; playback will begin automatically.");
-		return;
 	}
 
 	QString error;

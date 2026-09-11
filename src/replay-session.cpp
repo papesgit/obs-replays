@@ -11,16 +11,6 @@ namespace obs_replays {
 
 namespace {
 
-QJsonObject toJson(const ReplaySegment &segment)
-{
-	return {{"index", segment.index},
-		{"path", segment.relativePath},
-		{"startUs", QString::number(segment.startUs)},
-		{"endUs", QString::number(segment.endUs)},
-		{"sizeBytes", QString::number(segment.sizeBytes)},
-		{"finalized", segment.finalized}};
-}
-
 QJsonObject toJson(const ReplayEvent &event)
 {
 	return {{"id", event.id.toString(QUuid::WithoutBraces)},
@@ -47,14 +37,13 @@ bool ReplaySession::start(const SessionConfiguration &sessionConfiguration, QStr
 	id = QUuid::createUuid().toString(QUuid::WithoutBraces);
 	startedAtUtc = QDateTime::currentDateTimeUtc();
 	stoppedAtUtc = {};
-	segments.clear();
 	replayEvents.clear();
 	liveTimelineUs = 0;
 
 	const QString sessionName = QString("OBS-Replay-%1-%2")
 					    .arg(startedAtUtc.toString("yyyy-MM-dd_hh-mm-ss"), id.left(8));
 	directory = QDir(configuration.replayFolder).filePath(sessionName);
-	if (!QDir().mkpath(QDir(directory).filePath("segments"))) {
+	if (!QDir().mkpath(directory)) {
 		*error = "Could not create the replay session folder.";
 		directory.clear();
 		return false;
@@ -77,39 +66,6 @@ bool ReplaySession::stop(QString *error)
 
 	stoppedAtUtc = QDateTime::currentDateTimeUtc();
 	active = false;
-	return saveManifest(error);
-}
-
-bool ReplaySession::beginSegment(const QString &relativePath, TimelineUs startUs, QString *error)
-{
-	if (!active || relativePath.isEmpty() || startUs < 0) {
-		*error = "Cannot begin a segment for the current replay session.";
-		return false;
-	}
-	if (!segments.isEmpty() && !segments.last().finalized) {
-		*error = "The previous replay segment has not been finalized.";
-		return false;
-	}
-
-	segments.append({static_cast<int>(segments.size()) + 1, relativePath, startUs, 0, 0,
-			 false});
-	liveTimelineUs = startUs;
-	return saveManifest(error);
-}
-
-bool ReplaySession::finalizeCurrentSegment(TimelineUs endUs, qint64 sizeBytes, QString *error)
-{
-	if (!active || segments.isEmpty() || segments.last().finalized ||
-	    endUs < segments.last().startUs || sizeBytes < 0) {
-		*error = "Cannot finalize the current replay segment.";
-		return false;
-	}
-
-	ReplaySegment &segment = segments.last();
-	segment.endUs = endUs;
-	segment.sizeBytes = sizeBytes;
-	segment.finalized = true;
-	liveTimelineUs = endUs;
 	return saveManifest(error);
 }
 
@@ -145,9 +101,9 @@ const QString &ReplaySession::sessionDirectory() const
 	return directory;
 }
 
-const QList<ReplaySegment> &ReplaySession::recordedSegments() const
+QString ReplaySession::recordingPath() const
 {
-	return segments;
+	return QDir(directory).filePath(configuration.recordingRelativePath);
 }
 
 const QList<ReplayEvent> &ReplaySession::events() const
@@ -162,9 +118,6 @@ bool ReplaySession::saveManifest(QString *error) const
 		return false;
 	}
 
-	QJsonArray segmentArray;
-	for (const ReplaySegment &segment : segments)
-		segmentArray.append(toJson(segment));
 	QJsonArray eventArray;
 	for (const ReplayEvent &event : replayEvents)
 		eventArray.append(toJson(event));
@@ -176,11 +129,12 @@ bool ReplaySession::saveManifest(QString *error) const
 			 {"stoppedAtUtc", stoppedAtUtc.toString(Qt::ISODateWithMs)},
 			 {"source", QJsonObject{{"name", configuration.sourceName},
 								 {"uuid", configuration.sourceUuid}}},
-			 {"encoding", QJsonObject{{"container", "mkv"},
-								   {"videoBitrateMbps", configuration.videoBitrateMbps},
-								   {"audioBitrateKbps", configuration.audioBitrateKbps}}},
-			 {"segmentDurationSeconds", configuration.segmentDurationSeconds},
-			 {"segments", segmentArray},
+			 {"recording", QJsonObject{{"container", "mp4"},
+							 {"path", configuration.recordingRelativePath},
+							 {"fragmentDurationMilliseconds", 500}}},
+			 {"encoding", QJsonObject{{"container", "mp4"},
+							   {"videoBitrateMbps", configuration.videoBitrateMbps},
+							   {"audioBitrateKbps", configuration.audioBitrateKbps}}},
 			 {"events", eventArray}};
 
 	QSaveFile file(QDir(directory).filePath("session.json"));
