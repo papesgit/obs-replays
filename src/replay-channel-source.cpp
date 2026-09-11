@@ -1,9 +1,16 @@
 #include "replay-channel-source.h"
 
 #include <obs-module.h>
+#include <util/platform.h>
 extern "C" {
 #include <media-playback/media-playback.h>
 }
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <utility>
 
 namespace obs_replays {
 namespace {
@@ -11,6 +18,18 @@ constexpr const char *channel_a_source_id = "obs_replays_channel_a";
 constexpr const char *channel_b_source_id = "obs_replays_channel_b";
 const char *get_channel_a_name(void *) { return "OBS Replays Channel A"; }
 const char *get_channel_b_name(void *) { return "OBS Replays Channel B"; }
+
+uint32_t video_plane_rows(enum video_format format, uint32_t height, size_t plane)
+{
+	switch (format) {
+	case VIDEO_FORMAT_I420:
+		return plane == 0 ? height : (plane < 3 ? (height + 1) / 2 : 0);
+	case VIDEO_FORMAT_NV12:
+		return plane == 0 ? height : (plane == 1 ? (height + 1) / 2 : 0);
+	default:
+		return 0;
+	}
+}
 } // namespace
 
 ReplayChannelSource::ReplayChannelSource(obs_source_t *source, ReplayChannel channel)
@@ -58,8 +77,13 @@ void ReplayChannelSource::reset()
 		for (int index = 0; index < 2; ++index) {
 			decoders[index] = players[index].decoder;
 			players[index] = {};
+			cachedVideo[index] = {};
+			pendingAudio[index].clear();
 		}
 		activePlayer = 0;
+		fadingOutPlayer = -1;
+		fadeStartNs = 0;
+		fadeDurationNs = 0;
 	}
 	for (media_playback_t *decoder : decoders) {
 		if (decoder) {
@@ -83,9 +107,10 @@ bool ReplayChannelSource::cueNext(const QString &path, qint64 positionMillisecon
 	return loadSlot(nextPlayer, path, positionMilliseconds, PlayerState::LoadingCued, error);
 }
 
-bool ReplayChannelSource::takeCued(QString *error)
+bool ReplayChannelSource::takeCued(int fadeDurationMilliseconds, QString *error)
 {
 	media_playback_t *decoder = nullptr;
+	const bool fade = fadeDurationMilliseconds > 0;
 	{
 		std::lock_guard lock(mutex);
 		const int nextPlayer = activePlayer == 0 ? 1 : 0;
@@ -93,15 +118,30 @@ bool ReplayChannelSource::takeCued(QString *error)
 			*error = "The next replay event is not cued yet.";
 			return false;
 		}
-		players[activePlayer].state = PlayerState::Idle;
+		const int outgoingPlayer = activePlayer;
+		if (fade) {
+			fadingOutPlayer = outgoingPlayer;
+			fadeStartNs = os_gettime_ns();
+			fadeDurationNs = static_cast<uint64_t>(fadeDurationMilliseconds) * 1000000ULL;
+			// A player may still hold a frame from the preceding transition.
+			// Do not blend that stale image into this boundary; wait for its
+			// next decoded on-air frame instead.
+			cachedVideo[outgoingPlayer] = {};
+			pendingAudio[outgoingPlayer].clear();
+			pendingAudio[nextPlayer].clear();
+		} else {
+			players[outgoingPlayer].state = PlayerState::Idle;
+		}
 		activePlayer = nextPlayer;
 		players[activePlayer].state = PlayerState::Playing;
 		decoder = players[activePlayer].decoder;
 	}
-	obs_source_show_preloaded_video(source);
+	if (!fade)
+		obs_source_show_preloaded_video(source);
 	media_playback_play_pause(decoder, false);
-	blog(LOG_INFO, "[obs-replays] Taking preloaded Channel %c player %d to air.",
-	     replayChannel == ReplayChannel::A ? 'A' : 'B', activePlayer + 1);
+	blog(LOG_INFO, "[obs-replays] Taking preloaded Channel %c player %d to air%s.",
+	     replayChannel == ReplayChannel::A ? 'A' : 'B', activePlayer + 1,
+	     fade ? " with an event fade" : "");
 	obs_source_media_started(source);
 	return true;
 }
@@ -146,8 +186,134 @@ bool ReplayChannelSource::loadSlot(int playerIndex, const QString &path, qint64 
 void ReplayChannelSource::releaseSlot(int playerIndex)
 {
 	media_playback_t *decoder = nullptr;
-	{ std::lock_guard lock(mutex); decoder = players[playerIndex].decoder; players[playerIndex] = {}; }
+	{
+		std::lock_guard lock(mutex);
+		decoder = players[playerIndex].decoder;
+		players[playerIndex] = {};
+		cachedVideo[playerIndex] = {};
+		pendingAudio[playerIndex].clear();
+	}
 	if (decoder) { media_playback_stop(decoder); media_playback_destroy(decoder); }
+}
+
+bool ReplayChannelSource::cacheVideoFrame(CachedVideoFrame &destination,
+					  const obs_source_frame *sourceFrame)
+{
+	if (!sourceFrame || (sourceFrame->format != VIDEO_FORMAT_I420 &&
+			     sourceFrame->format != VIDEO_FORMAT_NV12))
+		return false;
+
+	CachedVideoFrame copy = {};
+	copy.frame = *sourceFrame;
+	for (size_t plane = 0; plane < MAX_AV_PLANES; ++plane) {
+		const uint32_t rows = video_plane_rows(sourceFrame->format, sourceFrame->height, plane);
+		if (!rows)
+			continue;
+		if (!sourceFrame->data[plane] || !sourceFrame->linesize[plane])
+			return false;
+		const size_t bytes = static_cast<size_t>(sourceFrame->linesize[plane]) * rows;
+		copy.data[plane].assign(sourceFrame->data[plane], sourceFrame->data[plane] + bytes);
+		copy.frame.data[plane] = copy.data[plane].data();
+	}
+	copy.valid = true;
+	destination = std::move(copy);
+	return true;
+}
+
+bool ReplayChannelSource::blendVideoFrames(const CachedVideoFrame &outgoing,
+					   const CachedVideoFrame &incoming, float incomingOpacity,
+					   CachedVideoFrame &destination)
+{
+	if (!outgoing.valid || !incoming.valid || outgoing.frame.format != incoming.frame.format ||
+	    outgoing.frame.width != incoming.frame.width || outgoing.frame.height != incoming.frame.height ||
+	    (outgoing.frame.format != VIDEO_FORMAT_I420 && outgoing.frame.format != VIDEO_FORMAT_NV12))
+		return false;
+
+	CachedVideoFrame blend = outgoing;
+	for (size_t plane = 0; plane < MAX_AV_PLANES; ++plane) {
+		const uint32_t rows = video_plane_rows(blend.frame.format, blend.frame.height, plane);
+		if (!rows)
+			continue;
+		if (blend.frame.linesize[plane] != incoming.frame.linesize[plane])
+			return false;
+		const size_t bytes = static_cast<size_t>(blend.frame.linesize[plane]) * rows;
+		for (size_t index = 0; index < bytes; ++index) {
+			const float mixed = outgoing.data[plane][index] * (1.0f - incomingOpacity) +
+					    incoming.data[plane][index] * incomingOpacity;
+			blend.data[plane][index] = static_cast<uint8_t>(std::clamp(mixed, 0.0f, 255.0f));
+		}
+		blend.frame.data[plane] = blend.data[plane].data();
+	}
+	blend.valid = true;
+	destination = std::move(blend);
+	return true;
+}
+
+ReplayChannelSource::CachedAudioFrame ReplayChannelSource::cacheAudioFrame(
+	const obs_source_audio *sourceAudio)
+{
+	CachedAudioFrame copy = {};
+	if (!sourceAudio || sourceAudio->format == AUDIO_FORMAT_UNKNOWN || !sourceAudio->frames)
+		return copy;
+	copy.audio = *sourceAudio;
+	const size_t planes = get_audio_planes(sourceAudio->format, sourceAudio->speakers);
+	const size_t bytesPerPlane = get_audio_size(sourceAudio->format, sourceAudio->speakers,
+						      sourceAudio->frames);
+	for (size_t plane = 0; plane < planes; ++plane) {
+		if (!sourceAudio->data[plane])
+			return {};
+		copy.data[plane].assign(sourceAudio->data[plane],
+					       sourceAudio->data[plane] + bytesPerPlane);
+		copy.audio.data[plane] = copy.data[plane].data();
+	}
+	return copy;
+}
+
+bool ReplayChannelSource::blendAudioFrames(const CachedAudioFrame &outgoing,
+					   const CachedAudioFrame &incoming, float incomingGain,
+					   CachedAudioFrame &destination)
+{
+	if (!outgoing.audio.frames || outgoing.audio.frames != incoming.audio.frames ||
+	    outgoing.audio.format != incoming.audio.format ||
+	    outgoing.audio.speakers != incoming.audio.speakers ||
+	    outgoing.audio.samples_per_sec != incoming.audio.samples_per_sec)
+		return false;
+
+	CachedAudioFrame blend = outgoing;
+	blend.audio.timestamp = std::max(outgoing.audio.timestamp, incoming.audio.timestamp);
+	const float outgoingGain = std::sqrt(std::max(0.0f, 1.0f - incomingGain * incomingGain));
+	const size_t planes = get_audio_planes(blend.audio.format, blend.audio.speakers);
+	const size_t samples = is_audio_planar(blend.audio.format)
+				   ? blend.audio.frames
+				   : static_cast<size_t>(blend.audio.frames) * get_audio_channels(blend.audio.speakers);
+	for (size_t plane = 0; plane < planes; ++plane) {
+		if (blend.audio.format == AUDIO_FORMAT_FLOAT || blend.audio.format == AUDIO_FORMAT_FLOAT_PLANAR) {
+			auto *out = reinterpret_cast<float *>(blend.data[plane].data());
+			const auto *in = reinterpret_cast<const float *>(incoming.data[plane].data());
+			for (size_t sample = 0; sample < samples; ++sample)
+				out[sample] = out[sample] * outgoingGain + in[sample] * incomingGain;
+		} else if (blend.audio.format == AUDIO_FORMAT_16BIT ||
+			   blend.audio.format == AUDIO_FORMAT_16BIT_PLANAR) {
+			auto *out = reinterpret_cast<int16_t *>(blend.data[plane].data());
+			const auto *in = reinterpret_cast<const int16_t *>(incoming.data[plane].data());
+			for (size_t sample = 0; sample < samples; ++sample) {
+				const float value = out[sample] * outgoingGain + in[sample] * incomingGain;
+				out[sample] = static_cast<int16_t>(std::clamp(value, -32768.0f, 32767.0f));
+			}
+		} else {
+			return false;
+		}
+		blend.audio.data[plane] = blend.data[plane].data();
+	}
+	destination = std::move(blend);
+	return true;
+}
+
+float ReplayChannelSource::transitionProgressLocked(uint64_t nowNs) const
+{
+	if (fadingOutPlayer < 0 || !fadeDurationNs)
+		return 1.0f;
+	return std::clamp(static_cast<float>(nowNs - fadeStartNs) / fadeDurationNs, 0.0f, 1.0f);
 }
 
 void *ReplayChannelSource::createA(obs_data_t *, obs_source_t *source) { return new ReplayChannelSource(source, ReplayChannel::A); }
@@ -178,6 +344,82 @@ void ReplayChannelSource::playbackStopped(void *data)
 		blog(LOG_WARNING, "[obs-replays] Channel %c player %d stopped before completing playout.",
 		     callback->channel->channel() == ReplayChannel::A ? 'A' : 'B',
 		     callback->playerIndex + 1);
+}
+
+void ReplayChannelSource::outputTransitionVideo(int playerIndex, obs_source_frame *frame)
+{
+	CachedVideoFrame blended = {};
+	media_playback_t *decoderToPause = nullptr;
+	bool outputCurrent = false;
+	bool outputBlended = false;
+	{
+		std::lock_guard lock(mutex);
+		if (fadingOutPlayer < 0)
+			return;
+		cacheVideoFrame(cachedVideo[playerIndex], frame);
+		const float progress = transitionProgressLocked(os_gettime_ns());
+		if (cachedVideo[fadingOutPlayer].valid && cachedVideo[activePlayer].valid &&
+		    blendVideoFrames(cachedVideo[fadingOutPlayer], cachedVideo[activePlayer], progress, blended)) {
+			blended.frame.timestamp = frame->timestamp;
+			outputBlended = true;
+		}
+		if (!outputBlended && playerIndex == fadingOutPlayer)
+			outputCurrent = true;
+		if (progress >= 1.0f) {
+			decoderToPause = players[fadingOutPlayer].decoder;
+			players[fadingOutPlayer].state = PlayerState::Idle;
+			pendingAudio[fadingOutPlayer].clear();
+			fadingOutPlayer = -1;
+			fadeStartNs = 0;
+			fadeDurationNs = 0;
+			outputCurrent = playerIndex == activePlayer;
+		}
+	}
+	if (decoderToPause)
+		media_playback_play_pause(decoderToPause, true);
+	if (outputBlended) {
+		obs_source_set_video_frame(source, &blended.frame);
+		obs_source_output_video(source, &blended.frame);
+	} else if (outputCurrent) {
+		obs_source_set_video_frame(source, frame);
+		obs_source_output_video(source, frame);
+	}
+}
+
+void ReplayChannelSource::outputTransitionAudio(int playerIndex, obs_source_audio *audio)
+{
+	CachedAudioFrame mixed = {};
+	bool outputMixed = false;
+	{
+		std::lock_guard lock(mutex);
+		if (fadingOutPlayer < 0)
+			return;
+		CachedAudioFrame cached = cacheAudioFrame(audio);
+		if (!cached.audio.frames)
+			return;
+		auto &queue = pendingAudio[playerIndex];
+		queue.emplace_back(std::move(cached));
+		if (queue.size() > 4)
+			queue.pop_front();
+		auto &outgoing = pendingAudio[fadingOutPlayer];
+		auto &incoming = pendingAudio[activePlayer];
+		if (outgoing.empty() || incoming.empty())
+			return;
+		const float linearProgress = transitionProgressLocked(os_gettime_ns());
+		constexpr float halfPi = 1.57079632679f;
+		const float incomingGain = std::sin(linearProgress * halfPi);
+		if (blendAudioFrames(outgoing.front(), incoming.front(), incomingGain, mixed)) {
+			outgoing.pop_front();
+			incoming.pop_front();
+			outputMixed = true;
+		} else if (playerIndex == activePlayer) {
+			mixed = std::move(incoming.front());
+			incoming.pop_front();
+			outputMixed = true;
+		}
+	}
+	if (outputMixed)
+		obs_source_output_audio(source, &mixed.audio);
 }
 
 void ReplayChannelSource::receiveVideo(int playerIndex, obs_source_frame *frame, bool isSeekFrame)
@@ -222,6 +464,11 @@ void ReplayChannelSource::receiveVideo(int playerIndex, obs_source_frame *frame,
 		     static_cast<long long>(seekPositionMilliseconds));
 	}
 	if (preloadCue) {
+		CachedVideoFrame cueFrame = {};
+		if (cacheVideoFrame(cueFrame, frame)) {
+			std::lock_guard lock(mutex);
+			cachedVideo[playerIndex] = std::move(cueFrame);
+		}
 		obs_source_preload_video(source, frame);
 		media_playback_play_pause(decoderToPause, true);
 		blog(LOG_INFO, "[obs-replays] Channel %c player %d is cued.",
@@ -236,6 +483,17 @@ void ReplayChannelSource::receiveVideo(int playerIndex, obs_source_frame *frame,
 		     replayChannel == ReplayChannel::A ? 'A' : 'B', playerIndex + 1);
 		media_playback_play_pause(decoderToResume, false);
 	}
+	bool transitionOutput = false;
+	if (!isSeekFrame && !setSeekFrame) {
+		std::lock_guard lock(mutex);
+		transitionOutput = fadingOutPlayer >= 0 &&
+			(playerIndex == activePlayer || playerIndex == fadingOutPlayer) &&
+			players[playerIndex].state == PlayerState::Playing;
+	}
+	if (transitionOutput) {
+		outputTransitionVideo(playerIndex, frame);
+		return;
+	}
 	if (outputActive && !setSeekFrame) {
 		// Keep OBS's retained async texture current as well as submitting the
 		// timed frame. If the underlying segment reaches EOF while an outro
@@ -249,8 +507,18 @@ void ReplayChannelSource::receiveVideo(int playerIndex, obs_source_frame *frame,
 
 void ReplayChannelSource::receiveAudio(int playerIndex, obs_source_audio *audio)
 {
-	std::lock_guard lock(mutex);
-	if (playerIndex == activePlayer && players[playerIndex].state == PlayerState::Playing)
+	bool fading = false;
+	bool outputActive = false;
+	{
+		std::lock_guard lock(mutex);
+		fading = fadingOutPlayer >= 0;
+		outputActive = playerIndex == activePlayer && players[playerIndex].state == PlayerState::Playing;
+	}
+	if (fading) {
+		outputTransitionAudio(playerIndex, audio);
+		return;
+	}
+	if (outputActive)
 		obs_source_output_audio(source, audio);
 }
 

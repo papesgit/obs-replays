@@ -69,6 +69,8 @@ QSpinBox *audio_bitrate_selector = nullptr;
 QComboBox *replay_scene_selector = nullptr;
 QComboBox *intro_transition_selector = nullptr;
 QComboBox *outro_transition_selector = nullptr;
+QComboBox *between_events_transition_selector = nullptr;
+QSpinBox *between_events_fade_duration_selector = nullptr;
 QSpinBox *pre_roll_seconds_selector = nullptr;
 QSpinBox *post_roll_seconds_selector = nullptr;
 QLabel *settings_status = nullptr;
@@ -141,6 +143,14 @@ void update_playout_button()
 		play_events_button->setText("Play selected events");
 		play_events_button->setEnabled(true);
 	}
+}
+
+qint64 between_events_fade_duration_milliseconds()
+{
+	if (!between_events_transition_selector || !between_events_fade_duration_selector ||
+	    between_events_transition_selector->currentData().toString() != "fade")
+		return 0;
+	return between_events_fade_duration_selector->value();
 }
 
 qint64 stinger_transition_point_milliseconds(obs_source_t *transition)
@@ -326,6 +336,8 @@ void load_settings()
 	const QSignalBlocker scene_blocker(replay_scene_selector);
 	const QSignalBlocker intro_blocker(intro_transition_selector);
 	const QSignalBlocker outro_blocker(outro_transition_selector);
+	const QSignalBlocker between_events_blocker(between_events_transition_selector);
+	const QSignalBlocker fade_duration_blocker(between_events_fade_duration_selector);
 
 	auto select_saved_value = [](QComboBox *selector, const char *value) {
 		const int index = selector->findText(QString::fromUtf8(value));
@@ -349,6 +361,16 @@ void load_settings()
 			   obs_data_get_string(collection_settings, "intro_transition"));
 	select_saved_value(outro_transition_selector,
 			   obs_data_get_string(collection_settings, "outro_transition"));
+	const QString between_events = QString::fromUtf8(
+		obs_data_get_string(collection_settings, "between_events_transition"));
+	const int between_events_index = between_events_transition_selector->findData(
+		between_events.isEmpty() ? "fade" : between_events);
+	between_events_transition_selector->setCurrentIndex(
+		between_events_index >= 0 ? between_events_index : 0);
+	const int fade_duration =
+		static_cast<int>(obs_data_get_int(collection_settings, "between_events_fade_duration_ms"));
+	if (fade_duration > 0)
+		between_events_fade_duration_selector->setValue(fade_duration);
 
 	const int pre_roll_seconds =
 		(int)obs_data_get_int(collection_settings, "pre_roll_seconds");
@@ -395,6 +417,10 @@ void save_settings()
 	set_selector("replay_scene", replay_scene_selector);
 	set_selector("intro_transition", intro_transition_selector);
 	set_selector("outro_transition", outro_transition_selector);
+	obs_data_set_string(collection_settings, "between_events_transition",
+			    between_events_transition_selector->currentData().toString().toUtf8().constData());
+	obs_data_set_int(collection_settings, "between_events_fade_duration_ms",
+			 between_events_fade_duration_selector->value());
 	obs_data_set_int(collection_settings, "pre_roll_seconds", pre_roll_seconds_selector->value());
 	obs_data_set_int(collection_settings, "post_roll_seconds", post_roll_seconds_selector->value());
 
@@ -860,6 +886,8 @@ void start_active_replay_event(void *data)
 	if (!channel)
 		return;
 	qint64 timer_duration = item.durationMilliseconds;
+	if (replay_playout_index + 1 < replay_playout_queue.size())
+		timer_duration = std::max<qint64>(0, timer_duration - between_events_fade_duration_milliseconds());
 	if (replay_playout_index == 0)
 		timer_duration += first_event_intro_lead_milliseconds;
 	if (event_playout_timer)
@@ -869,9 +897,30 @@ void start_active_replay_event(void *data)
 				 .arg(replay_playout_queue.size()));
 	if (replay_playout_index + 1 < replay_playout_queue.size()) {
 		const ReplayPlayoutItem &next = replay_playout_queue.at(replay_playout_index + 1);
-		QString error;
-		if (!channel->cueNext(next.segmentPath, next.inMilliseconds, &error))
-			playout_status->setText(error);
+		auto cue_next = [next]() {
+			if (!active_replay_playback_source)
+				return;
+			auto *replay_channel = obs_replays::ReplayChannelSource::fromSource(
+				active_replay_playback_source);
+			QString error;
+			if (!replay_channel ||
+			    !replay_channel->cueNext(next.segmentPath, next.inMilliseconds, &error))
+				playout_status->setText(error.isEmpty() ? "The next replay event could not be cued."
+								       : error);
+		};
+		const qint64 fade_duration = between_events_fade_duration_milliseconds();
+		if (replay_playout_index > 0 && fade_duration > 0) {
+			const uint64_t generation = playback_generation;
+			const int event_index = replay_playout_index;
+			QTimer::singleShot(static_cast<int>(fade_duration + 50),
+					       [cue_next, generation, event_index]() {
+						       if (!module_unloading && generation == playback_generation &&
+							   event_index == replay_playout_index)
+							       cue_next();
+					       });
+		} else {
+			cue_next();
+		}
 	}
 }
 
@@ -924,7 +973,8 @@ void advance_replay_playout()
 		++replay_playout_index;
 		pending_seek_milliseconds = replay_playout_queue.at(replay_playout_index).inMilliseconds;
 		awaiting_event_start = true;
-		if (!channel || !channel->takeCued(&error)) {
+		if (!channel || !channel->takeCued(
+				between_events_fade_duration_milliseconds(), &error)) {
 			replay_playout_index = previous_index;
 			awaiting_event_start = false;
 			playout_status->setText(error);
@@ -1114,6 +1164,16 @@ QWidget *create_replay_dock()
 	playout_form->addRow("Intro transition", intro_transition_selector);
 	outro_transition_selector = new QComboBox(playout_group);
 	playout_form->addRow("Outro transition", outro_transition_selector);
+	between_events_transition_selector = new QComboBox(playout_group);
+	between_events_transition_selector->addItem("Cut", "cut");
+	between_events_transition_selector->addItem("Fade", "fade");
+	between_events_transition_selector->setCurrentIndex(1);
+	playout_form->addRow("Between replay events", between_events_transition_selector);
+	between_events_fade_duration_selector = new QSpinBox(playout_group);
+	between_events_fade_duration_selector->setRange(50, 2000);
+	between_events_fade_duration_selector->setValue(150);
+	between_events_fade_duration_selector->setSuffix(" ms");
+	playout_form->addRow("Event fade duration", between_events_fade_duration_selector);
 
 	auto *refresh_playout = new QPushButton("Refresh scenes and transitions", playout_group);
 	QObject::connect(refresh_playout, &QPushButton::clicked,
@@ -1245,6 +1305,8 @@ void obs_module_unload(void)
 	replay_scene_selector = nullptr;
 	intro_transition_selector = nullptr;
 	outro_transition_selector = nullptr;
+	between_events_transition_selector = nullptr;
+	between_events_fade_duration_selector = nullptr;
 	pre_roll_seconds_selector = nullptr;
 	post_roll_seconds_selector = nullptr;
 	settings_status = nullptr;

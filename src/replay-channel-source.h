@@ -1,17 +1,15 @@
 #pragma once
 
+#include <obs.h>
+
 #include <QString>
 #include <QByteArray>
 
 #include <array>
+#include <deque>
 #include <mutex>
+#include <vector>
 
-struct obs_source;
-typedef struct obs_source obs_source_t;
-struct obs_data;
-typedef struct obs_data obs_data_t;
-struct obs_source_frame;
-struct obs_source_audio;
 struct media_playback;
 typedef struct media_playback media_playback_t;
 
@@ -28,7 +26,7 @@ public:
 	void reset();
 	bool load(const QString &path, qint64 positionMilliseconds, QString *error);
 	bool cueNext(const QString &path, qint64 positionMilliseconds, QString *error);
-	bool takeCued(QString *error);
+	bool takeCued(int fadeDurationMilliseconds, QString *error);
 
 private:
 	enum class PlayerState {
@@ -51,6 +49,15 @@ private:
 		ReplayChannelSource *channel = nullptr;
 		int playerIndex = 0;
 	};
+	struct CachedVideoFrame {
+		obs_source_frame frame = {};
+		std::array<std::vector<uint8_t>, MAX_AV_PLANES> data;
+		bool valid = false;
+	};
+	struct CachedAudioFrame {
+		obs_source_audio audio = {};
+		std::array<std::vector<uint8_t>, MAX_AV_PLANES> data;
+	};
 
 	ReplayChannelSource(obs_source_t *source, ReplayChannel channel);
 	~ReplayChannelSource();
@@ -70,6 +77,15 @@ private:
 	void receiveVideo(int playerIndex, obs_source_frame *frame, bool seekFrame);
 	void receiveAudio(int playerIndex, obs_source_audio *audio);
 	void releaseSlot(int playerIndex);
+	static bool cacheVideoFrame(CachedVideoFrame &destination, const obs_source_frame *source);
+	static bool blendVideoFrames(const CachedVideoFrame &outgoing, const CachedVideoFrame &incoming,
+				    float incomingOpacity, CachedVideoFrame &destination);
+	static CachedAudioFrame cacheAudioFrame(const obs_source_audio *source);
+	static bool blendAudioFrames(const CachedAudioFrame &outgoing, const CachedAudioFrame &incoming,
+				    float incomingGain, CachedAudioFrame &destination);
+	float transitionProgressLocked(uint64_t nowNs) const;
+	void outputTransitionVideo(int playerIndex, obs_source_frame *frame);
+	void outputTransitionAudio(int playerIndex, obs_source_audio *audio);
 
 	obs_source_t *source = nullptr;
 	ReplayChannel replayChannel;
@@ -77,8 +93,13 @@ private:
 	// non-Qt identifier here.
 	std::array<Slot, 2> players;
 	std::array<PlayerCallback, 2> playerCallbacks;
+	std::array<CachedVideoFrame, 2> cachedVideo;
+	std::array<std::deque<CachedAudioFrame>, 2> pendingAudio;
 	std::mutex mutex;
 	int activePlayer = 0;
+	int fadingOutPlayer = -1;
+	uint64_t fadeStartNs = 0;
+	uint64_t fadeDurationNs = 0;
 	bool active = false;
 };
 
