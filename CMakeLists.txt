@@ -66,12 +66,57 @@ string(REPLACE "${OBS_REPLAYS_STATIC_SPEED_SCALING}"
 file(WRITE "${OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR}/decode.c"
      "#include \"media-playback-runtime.h\"\n${OBS_REPLAYS_DECODE_SOURCE}")
 
+# FFmpeg seeks backward to a preceding keyframe. For replay markers we need
+# the first decoded frame at or after the requested position, not that GOP's
+# keyframe. Patch the local media-playback unit to decode through seek preroll
+# while paused before invoking our seek callback.
+file(READ "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/media.c"
+     OBS_REPLAYS_MEDIA_SOURCE)
+set(OBS_REPLAYS_ORIGINAL_SEEK_PRELOAD [=[
+	if (m->has_video && m->is_local_file) {
+		mp_decode_flush(&m->v);
+		if (m->seek_next_ts && m->pause && m->v_preload_cb && mp_media_prepare_frames(m))
+			mp_media_next_video(m, true);
+	}
+]=])
+set(OBS_REPLAYS_EXACT_SEEK_PRELOAD [=[
+	if (m->has_video && m->is_local_file) {
+		mp_decode_flush(&m->v);
+		if (m->seek_next_ts && m->pause && m->v_preload_cb) {
+			const int64_t seek_target_ns = pos * 1000;
+			while (mp_media_prepare_frames(m)) {
+				const bool video_at_target =
+					m->v.frame_ready && m->v.frame_pts >= seek_target_ns;
+				if (m->has_audio && m->a.frame_ready &&
+				    m->a.frame_pts < seek_target_ns)
+					m->a.frame_ready = false;
+				if (video_at_target) {
+					mp_media_next_video(m, true);
+					break;
+				}
+				if (m->v.frame_ready)
+					m->v.frame_ready = false;
+			}
+		}
+	}
+]=])
+string(FIND "${OBS_REPLAYS_MEDIA_SOURCE}" "${OBS_REPLAYS_ORIGINAL_SEEK_PRELOAD}"
+            OBS_REPLAYS_SEEK_PRELOAD_OFFSET)
+if(OBS_REPLAYS_SEEK_PRELOAD_OFFSET EQUAL -1)
+  message(FATAL_ERROR "Could not apply OBS Replays' exact seek patch")
+endif()
+string(REPLACE "${OBS_REPLAYS_ORIGINAL_SEEK_PRELOAD}"
+               "${OBS_REPLAYS_EXACT_SEEK_PRELOAD}"
+               OBS_REPLAYS_MEDIA_SOURCE "${OBS_REPLAYS_MEDIA_SOURCE}")
+file(WRITE "${OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR}/media.c"
+     "${OBS_REPLAYS_MEDIA_SOURCE}")
+
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/cache.c"
           "${OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR}/decode.c"
           "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/media-playback.c"
-          "${OBS_REPLAYS_MEDIA_PLAYBACK_DIR}/media-playback/media.c"
+          "${OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR}/media.c"
 )
 target_include_directories(
   ${CMAKE_PROJECT_NAME}
