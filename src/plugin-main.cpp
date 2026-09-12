@@ -1696,6 +1696,13 @@ void write_start_playout_response(obs_data_t *request, obs_data_t *response)
 		write_websocket_error(response, "Replay playout is already active.");
 		return;
 	}
+	const QString play_order = obs_data_has_user_value(request, "playOrder")
+				       ? QString::fromUtf8(obs_data_get_string(request, "playOrder"))
+				       : "creation";
+	if (play_order != "creation" && play_order != "provided") {
+		write_websocket_error(response, "playOrder must be 'creation' or 'provided'.");
+		return;
+	}
 	obs_data_array_t *event_ids = obs_data_get_array(request, "eventIds");
 	if (!event_ids || obs_data_array_count(event_ids) == 0) {
 		if (event_ids)
@@ -1718,6 +1725,11 @@ void write_start_playout_response(obs_data_t *request, obs_data_t *response)
 		event_indices.append(event_index);
 	}
 	obs_data_array_release(event_ids);
+	// Treat IDs as a selected set by default, consistent with the dock. A
+	// controller can explicitly request the supplied sequence when it owns an
+	// intentional editorial ordering.
+	if (play_order == "creation")
+		std::sort(event_indices.begin(), event_indices.end());
 	QString error;
 	if (!play_replay_event_indices(event_indices, &error)) {
 		write_websocket_error(response, error);

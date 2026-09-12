@@ -165,11 +165,19 @@ Returns the deleted `eventId` on success.
   "eventIds": [
     { "eventId": "first-event-uuid" },
     { "eventId": "second-event-uuid" }
-  ]
+  ],
+  "playOrder": "creation"
 }
 ```
 
-Starts playout using the replay scene and transitions configured in the dock. Events are played in the exact supplied order. `eventIds` must be object entries rather than an array of strings because OBS's native Vendor API data model supports object arrays. The request fails if playout is already active, an event does not exist, or a required recording take is unavailable. On success it returns playout status.
+Starts playout using the replay scene and transitions configured in the dock. `eventIds` must be object entries rather than an array of strings because OBS's native Vendor API data model supports object arrays.
+
+`playOrder` is optional:
+
+- `"creation"` (default): events play in replay-session creation/list order, regardless of the order in `eventIds`.
+- `"provided"`: events play in the exact order supplied in `eventIds`.
+
+The request fails if playout is already active, an event does not exist, a required recording take is unavailable, or `playOrder` is invalid. On success it returns playout status.
 
 ### `StopPlayout`
 
