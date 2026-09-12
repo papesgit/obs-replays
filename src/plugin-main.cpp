@@ -124,8 +124,10 @@ constexpr const char *playback_source_name = "OBS Replays Channel A";
 constexpr const char *playback_source_id = "obs_replays_channel_a";
 
 QWidget *replay_dock = nullptr;
+QWidget *capture_settings_group = nullptr;
 QComboBox *source_selector = nullptr;
 QLineEdit *replay_folder_selector = nullptr;
+QPushButton *choose_replay_folder_button = nullptr;
 QSpinBox *video_bitrate_selector = nullptr;
 QSpinBox *audio_bitrate_selector = nullptr;
 QComboBox *replay_scene_selector = nullptr;
@@ -188,6 +190,7 @@ void play_selected_replay_events();
 void outro_transition_stop_callback(void *, calldata_t *);
 void advance_replay_playout();
 bool parse_timeline(const QString &text, obs_replays::TimelineUs *timestamp_us);
+void refresh_events_list();
 
 void update_playout_button()
 {
@@ -446,6 +449,10 @@ void clear_replay_folder()
 		else
 			failures.append(session.fileName());
 	}
+	if (removed > 0) {
+		replay_session.reset();
+		refresh_events_list();
+	}
 	update_storage_status();
 	if (failures.isEmpty()) {
 		QMessageBox::information(replay_dock, "Clear replay folder",
@@ -666,6 +673,10 @@ void set_recording_controls(bool recording)
 		start_recording_button->setEnabled(!recording);
 	if (stop_recording_button)
 		stop_recording_button->setEnabled(recording);
+	if (capture_settings_group)
+		capture_settings_group->setEnabled(!recording);
+	if (choose_replay_folder_button)
+		choose_replay_folder_button->setEnabled(!recording);
 	for (QPushButton *button : mark_event_buttons)
 		button->setEnabled(recording);
 }
@@ -787,7 +798,7 @@ void update_recording_session()
 		source_capture->stop();
 		recording_timer->stop();
 		set_recording_controls(false);
-		recording_status->setText(error.isEmpty() ? "Recording session stopped."
+		recording_status->setText(error.isEmpty() ? "Recording take stopped."
 								 : error);
 		segment_writer.reset();
 		source_capture.reset();
@@ -813,7 +824,7 @@ void update_recording_session()
 void start_recording_session()
 {
 	if (replay_session && replay_session->isActive()) {
-		recording_status->setText("A replay recording session is already active.");
+		recording_status->setText("A replay recording take is already active.");
 		return;
 	}
 
@@ -833,10 +844,18 @@ void start_recording_session()
 	configuration.sourceUuid = QString::fromUtf8(source_uuid ? source_uuid : "");
 	configuration.videoBitrateMbps = video_bitrate_selector->value();
 	configuration.audioBitrateKbps = audio_bitrate_selector->value();
+	if (replay_session && !replay_session->isActive()) {
+		const QString current_folder = QFileInfo(replay_session->sessionDirectory()).absoluteDir().absolutePath();
+		if (QDir::cleanPath(current_folder) != QDir::cleanPath(QDir(configuration.replayFolder).absolutePath()))
+			replay_session.reset();
+	}
 
-	auto session = std::make_unique<obs_replays::ReplaySession>();
+	std::unique_ptr<obs_replays::ReplaySession> new_session;
+	if (!replay_session)
+		new_session = std::make_unique<obs_replays::ReplaySession>();
+	auto *session = replay_session ? replay_session.get() : new_session.get();
 	QString error;
-	if (!session->start(configuration, &error)) {
+	if (!session || !session->start(configuration, &error)) {
 		obs_source_release(source);
 		recording_status->setText(error);
 		return;
@@ -861,7 +880,8 @@ void start_recording_session()
 		return;
 	}
 
-	replay_session = std::move(session);
+	if (new_session)
+		replay_session = std::move(new_session);
 	source_capture = std::move(capture);
 	segment_writer = std::move(writer);
 	recording_stop_requested_ns = 0;
@@ -869,13 +889,13 @@ void start_recording_session()
 	refresh_events_list();
 	set_recording_controls(true);
 	recording_timer->start();
-	recording_status->setText("Starting replay recording session…");
+	recording_status->setText("Starting replay recording take…");
 }
 
 void stop_recording_session()
 {
 	if (!segment_writer || !segment_writer->isActive()) {
-		recording_status->setText("There is no active replay recording session.");
+		recording_status->setText("There is no active replay recording take.");
 		return;
 	}
 	stop_recording_button->setEnabled(false);
@@ -1262,13 +1282,13 @@ void play_selected_replay_events()
 		selected_event_indices.append(event_index);
 	}
 	std::sort(selected_event_indices.begin(), selected_event_indices.end());
-	const QString recording_path = replay_session->recordingPath();
-	if (!QFileInfo::exists(recording_path)) {
-		playout_status->setText("The replay recording file is not available yet.");
-		return;
-	}
 	for (const int event_index : selected_event_indices) {
 		const obs_replays::ReplayEvent &event = replay_session->events().at(event_index);
+		const QString recording_path = replay_session->recordingPath(event.takeId);
+		if (!QFileInfo::exists(recording_path)) {
+			playout_status->setText("The recording take for a selected replay event is not available.");
+			return;
+		}
 		queue.append({recording_path, event.inUs / 1000,
 			      (event.outUs - event.inUs) / 1000,
 			      event.label.isEmpty() ? "Replay event" : event.label});
@@ -1291,6 +1311,54 @@ void play_selected_replay_events()
 		playout_status->setText(error);
 }
 
+void reopen_saved_replay_session()
+{
+	if (replay_session || !replay_folder_selector || replay_folder_selector->text().isEmpty())
+		return;
+	obs_source_t *source = source_from_selector(source_selector);
+	if (!source)
+		return;
+	obs_replays::SessionConfiguration configuration;
+	configuration.replayFolder = replay_folder_selector->text();
+	configuration.sourceName = QString::fromUtf8(obs_source_get_name(source));
+	configuration.sourceUuid = QString::fromUtf8(obs_source_get_uuid(source));
+	configuration.videoBitrateMbps = video_bitrate_selector->value();
+	configuration.audioBitrateKbps = audio_bitrate_selector->value();
+	obs_source_release(source);
+
+	auto session = std::make_unique<obs_replays::ReplaySession>();
+	QString error;
+	if (!session->open(configuration, &error))
+		return;
+	replay_session = std::move(session);
+	recording_status->setText(QString("Reopened replay session with %1 event%2 and %3 take%4.")
+					 .arg(replay_session->events().size())
+					 .arg(replay_session->events().size() == 1 ? "" : "s")
+					 .arg(replay_session->takes().size())
+					 .arg(replay_session->takes().size() == 1 ? "" : "s"));
+}
+
+void change_replay_folder()
+{
+	if (!replay_folder_selector)
+		return;
+	if (replay_session && replay_session->isActive()) {
+		const QString active_folder = QFileInfo(replay_session->sessionDirectory()).absoluteDir().absolutePath();
+		const QSignalBlocker blocker(replay_folder_selector);
+		replay_folder_selector->setText(active_folder);
+		update_storage_status();
+		recording_status->setText("Stop recording before changing the replay folder.");
+		return;
+	}
+
+	clear_playout_state();
+	replay_session.reset();
+	reopen_saved_replay_session();
+	refresh_events_list();
+	if (!replay_session)
+		recording_status->setText("No replay session in the selected folder.");
+}
+
 void frontend_event(enum obs_frontend_event event, void *)
 {
 	if (event == OBS_FRONTEND_EVENT_EXIT) {
@@ -1306,6 +1374,11 @@ void frontend_event(enum obs_frontend_event event, void *)
 		refresh_source_selector();
 		refresh_playout_selectors();
 		load_settings();
+		if (!replay_session || !replay_session->isActive()) {
+			replay_session.reset();
+			reopen_saved_replay_session();
+			refresh_events_list();
+		}
 		return;
 	}
 
@@ -1338,6 +1411,7 @@ QWidget *create_replay_dock()
 	capture_toggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 	layout->addWidget(capture_toggle);
 	auto *capture_group = new QWidget(content);
+	capture_settings_group = capture_group;
 	auto *capture_form = new QFormLayout(capture_group);
 	source_selector = new QComboBox(capture_group);
 	capture_form->addRow("Source", source_selector);
@@ -1349,15 +1423,15 @@ QWidget *create_replay_dock()
 	replay_folder_selector->setReadOnly(true);
 	replay_folder_selector->setPlaceholderText("Choose a folder for replay sessions");
 	replay_folder_layout->addWidget(replay_folder_selector);
-	auto *choose_replay_folder = new QPushButton("Browse", replay_folder_row);
-	QObject::connect(choose_replay_folder, &QPushButton::clicked, []() {
+	choose_replay_folder_button = new QPushButton("Browse", replay_folder_row);
+	QObject::connect(choose_replay_folder_button, &QPushButton::clicked, []() {
 		const QString folder = QFileDialog::getExistingDirectory(
 			replay_dock, "Choose replay folder", replay_folder_selector->text(),
 			QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
 		if (!folder.isEmpty())
 			replay_folder_selector->setText(QDir::toNativeSeparators(folder));
 	});
-	replay_folder_layout->addWidget(choose_replay_folder);
+	replay_folder_layout->addWidget(choose_replay_folder_button);
 	capture_form->addRow("Replay folder", replay_folder_row);
 
 	video_bitrate_selector = new QSpinBox(capture_group);
@@ -1381,6 +1455,8 @@ QWidget *create_replay_dock()
 	capture_form->addRow(QString(), clear_replay_folder_button);
 	QObject::connect(replay_folder_selector, &QLineEdit::textChanged,
 			 [](const QString &) { update_storage_status(); });
+	QObject::connect(replay_folder_selector, &QLineEdit::textChanged,
+			 [](const QString &) { change_replay_folder(); });
 	QObject::connect(video_bitrate_selector,
 			 QOverload<int>::of(&QSpinBox::valueChanged),
 			 [](int) { update_storage_status(); });
@@ -1566,6 +1642,7 @@ QWidget *create_replay_dock()
 	refresh_source_selector();
 	refresh_playout_selectors();
 	load_settings();
+	reopen_saved_replay_session();
 	update_storage_status();
 	refresh_events_list();
 	update_playout_button();
@@ -1635,8 +1712,10 @@ void obs_module_unload(void)
 	if (replay_dock)
 		obs_frontend_remove_dock(dock_id);
 	replay_dock = nullptr;
+	capture_settings_group = nullptr;
 	source_selector = nullptr;
 	replay_folder_selector = nullptr;
+	choose_replay_folder_button = nullptr;
 	video_bitrate_selector = nullptr;
 	audio_bitrate_selector = nullptr;
 	replay_scene_selector = nullptr;
