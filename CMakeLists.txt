@@ -109,7 +109,7 @@ endif()
 
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.cpp src/replay-session.cpp src/replay-session.h src/source-capture.cpp
+  PRIVATE src/plugin-main.cpp src/obs-websocket-vendor-api.h src/replay-session.cpp src/replay-session.h src/source-capture.cpp
           src/source-capture.h src/segment-writer.cpp src/segment-writer.h
           src/replay-channel-source.cpp src/replay-channel-source.h
           src/media-playback-runtime.c src/media-playback-runtime.h

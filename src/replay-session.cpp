@@ -162,6 +162,13 @@ bool ReplaySession::removeEvent(qsizetype index, QString *error)
 
 bool ReplaySession::isActive() const { return active; }
 TimelineUs ReplaySession::latestTimelineUs() const { return liveTimelineUs; }
+QString ReplaySession::sessionId() const { return id; }
+QUuid ReplaySession::activeTakeId() const
+{
+	const ReplayTake *take = activeTake();
+	return take ? take->id : QUuid();
+}
+const SessionConfiguration &ReplaySession::sessionConfiguration() const { return configuration; }
 const QString &ReplaySession::sessionDirectory() const { return directory; }
 
 QString ReplaySession::recordingPath() const

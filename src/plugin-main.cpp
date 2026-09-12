@@ -24,6 +24,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "replay-channel-source.h"
 #include "segment-writer.h"
 #include "source-capture.h"
+#include "obs-websocket-vendor-api.h"
 
 #include <QByteArray>
 #include <QAbstractItemView>
@@ -60,6 +61,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <iterator>
 
 namespace {
 
@@ -151,6 +153,7 @@ QTimer *settings_save_timer = nullptr;
 // OBS can destroy frontend dock widgets before calling obs_module_unload().
 // Keep shutdown cleanup independent from those Qt objects.
 bool module_unloading = false;
+obs_websocket_vendor websocket_vendor = nullptr;
 std::unique_ptr<obs_replays::ReplaySession> replay_session;
 std::unique_ptr<obs_replays::SourceCapture> source_capture;
 std::unique_ptr<obs_replays::SegmentWriter> segment_writer;
@@ -168,6 +171,7 @@ double event_playout_remaining_media_milliseconds = 0.0;
 uint64_t event_playout_last_tick_ns = 0;
 
 struct ReplayPlayoutItem {
+	QString eventId;
 	QString segmentPath;
 	qint64 inMilliseconds = 0;
 	qint64 durationMilliseconds = 0;
@@ -191,6 +195,131 @@ void outro_transition_stop_callback(void *, calldata_t *);
 void advance_replay_playout();
 bool parse_timeline(const QString &text, obs_replays::TimelineUs *timestamp_us);
 void refresh_events_list();
+void start_recording_session();
+void stop_recording_session();
+bool play_replay_event_indices(const QVector<int> &event_indices, QString *error);
+
+void set_websocket_string(obs_data_t *data, const char *key, const QString &value)
+{
+	const QByteArray utf8 = value.toUtf8();
+	obs_data_set_string(data, key, utf8.constData());
+}
+
+void write_websocket_session(obs_data_t *data)
+{
+	obs_data_set_bool(data, "available", replay_session != nullptr);
+	if (!replay_session)
+		return;
+
+	const auto &configuration = replay_session->sessionConfiguration();
+	set_websocket_string(data, "id", replay_session->sessionId());
+	set_websocket_string(data, "folder", replay_session->sessionDirectory());
+	set_websocket_string(data, "sourceName", configuration.sourceName);
+	set_websocket_string(data, "sourceUuid", configuration.sourceUuid);
+	obs_data_set_bool(data, "recording", replay_session->isActive());
+	set_websocket_string(data, "activeTakeId",
+			     replay_session->activeTakeId().toString(QUuid::WithoutBraces));
+	obs_data_set_int(data, "recordedThroughMs", replay_session->latestTimelineUs() / 1000);
+	obs_data_set_int(data, "takeCount", replay_session->takes().size());
+	obs_data_set_int(data, "eventCount", replay_session->events().size());
+}
+
+void write_websocket_event(obs_data_t *data, const obs_replays::ReplayEvent &event, int index)
+{
+	set_websocket_string(data, "id", event.id.toString(QUuid::WithoutBraces));
+	set_websocket_string(data, "takeId", event.takeId.toString(QUuid::WithoutBraces));
+	set_websocket_string(data, "label", event.label);
+	obs_data_set_int(data, "index", index + 1);
+	obs_data_set_int(data, "inMs", event.inUs / 1000);
+	obs_data_set_int(data, "outMs", event.outUs / 1000);
+	set_websocket_string(data, "createdAtUtc", event.createdAtUtc.toString(Qt::ISODateWithMs));
+}
+
+void write_websocket_events(obs_data_t *data)
+{
+	obs_data_array_t *events = obs_data_array_create();
+	if (replay_session) {
+		for (qsizetype index = 0; index < replay_session->events().size(); ++index) {
+			obs_data_t *event = obs_data_create();
+			write_websocket_event(event, replay_session->events().at(index), static_cast<int>(index));
+			obs_data_array_push_back(events, event);
+			obs_data_release(event);
+		}
+	}
+	obs_data_set_array(data, "events", events);
+	obs_data_array_release(events);
+}
+
+void write_websocket_recording_status(obs_data_t *data)
+{
+	const bool active = replay_session && replay_session->isActive();
+	obs_data_set_bool(data, "active", active);
+	if (!active)
+		return;
+	set_websocket_string(data, "sessionId", replay_session->sessionId());
+	set_websocket_string(data, "takeId", replay_session->activeTakeId().toString(QUuid::WithoutBraces));
+	obs_data_set_int(data, "recordedThroughMs", replay_session->latestTimelineUs() / 1000);
+	if (source_capture) {
+		obs_data_set_int(data, "capturedVideoFrames", source_capture->capturedVideoFrames());
+		obs_data_set_int(data, "capturedAudioFrames", source_capture->capturedAudioFrames());
+	}
+}
+
+void emit_websocket_event(const char *name)
+{
+	if (!websocket_vendor || module_unloading)
+		return;
+	obs_data_t *data = obs_data_create();
+	obs_data_set_int(data, "protocolVersion", 1);
+	write_websocket_session(data);
+	obs_replays_websocket_emit_event(websocket_vendor, name, data);
+	obs_data_release(data);
+}
+
+using WebsocketResponseWriter = void (*)(obs_data_t *, obs_data_t *);
+
+struct WebsocketResponseTask {
+	obs_data_t *request;
+	obs_data_t *response;
+	WebsocketResponseWriter writer;
+};
+
+void write_websocket_response_task(void *param)
+{
+	auto *task = static_cast<WebsocketResponseTask *>(param);
+	task->writer(task->request, task->response);
+}
+
+void websocket_request_callback(obs_data_t *request, obs_data_t *response, void *priv_data)
+{
+	auto writer = *static_cast<WebsocketResponseWriter *>(priv_data);
+	WebsocketResponseTask task{request, response, writer};
+	if (obs_in_task_thread(OBS_TASK_UI))
+		write_websocket_response_task(&task);
+	else
+		obs_queue_task(OBS_TASK_UI, write_websocket_response_task, &task, true);
+}
+
+void write_get_session_response(obs_data_t *, obs_data_t *response)
+{
+	obs_data_set_int(response, "protocolVersion", 1);
+	write_websocket_session(response);
+}
+
+void write_get_recording_status_response(obs_data_t *, obs_data_t *response)
+{
+	obs_data_set_int(response, "protocolVersion", 1);
+	write_websocket_recording_status(response);
+}
+
+void write_list_events_response(obs_data_t *, obs_data_t *response)
+{
+	obs_data_set_int(response, "protocolVersion", 1);
+	if (replay_session)
+		set_websocket_string(response, "sessionId", replay_session->sessionId());
+	write_websocket_events(response);
+}
+
 
 void update_playout_button()
 {
@@ -452,6 +581,7 @@ void clear_replay_folder()
 	if (removed > 0) {
 		replay_session.reset();
 		refresh_events_list();
+		emit_websocket_event("SessionChanged");
 	}
 	update_storage_status();
 	if (failures.isEmpty()) {
@@ -728,8 +858,10 @@ void update_replay_event_from_table(int row, int column)
 	QString error;
 	if (!replay_session->updateEvent(event_index, in_us, out_us, label->text(), &error))
 		playout_status->setText(error);
-	else
+	else {
 		playout_status->setText("Replay event updated.");
+		emit_websocket_event("EventListChanged");
+	}
 	refresh_events_list();
 }
 
@@ -748,13 +880,17 @@ void delete_selected_replay_events()
 	if (indices.isEmpty())
 		return;
 	std::sort(indices.begin(), indices.end(), std::greater<int>());
+	bool removed_any = false;
 	for (const int event_index : indices) {
 		QString error;
 		if (!replay_session->removeEvent(event_index, &error)) {
 			playout_status->setText(error);
 			break;
 		}
+		removed_any = true;
 	}
+	if (removed_any)
+		emit_websocket_event("EventListChanged");
 	refresh_events_list();
 }
 
@@ -780,6 +916,7 @@ void mark_replay_event(int seconds_back)
 		return;
 	}
 	refresh_events_list();
+	emit_websocket_event("EventListChanged");
 	recording_status->setText(QString("Replay event marked: last %1 seconds.").arg(seconds_back));
 }
 
@@ -804,6 +941,7 @@ void update_recording_session()
 		source_capture.reset();
 		recording_stop_requested_ns = 0;
 		recording_force_stop_issued = false;
+		emit_websocket_event("RecordingStopped");
 		return;
 	}
 
@@ -890,6 +1028,7 @@ void start_recording_session()
 	set_recording_controls(true);
 	recording_timer->start();
 	recording_status->setText("Starting replay recording take…");
+	emit_websocket_event("RecordingStarted");
 }
 
 void stop_recording_session()
@@ -1100,6 +1239,7 @@ void finish_outro_transition(void *data)
 		return;
 	outro_cleanup_pending = false;
 	clear_playout_state();
+	emit_websocket_event("PlayoutStopped");
 	playout_status->setText("Returned to the previous Program scene.");
 }
 
@@ -1262,43 +1402,36 @@ void advance_replay_playout()
 		playout_status->setText("Replay playout complete; returned to the previous Program scene.");
 }
 
-void play_selected_replay_events()
+bool play_replay_event_indices(const QVector<int> &event_indices, QString *error)
 {
-	if (!replay_session || !events_table || events_table->selectionModel()->selectedRows().isEmpty()) {
-		playout_status->setText("Select one or more replay events first.");
-		return;
+	if (!replay_session) {
+		*error = "There is no replay session open.";
+		return false;
+	}
+	if (event_indices.isEmpty()) {
+		*error = "Select one or more replay events first.";
+		return false;
 	}
 
 	QVector<ReplayPlayoutItem> queue;
-	QVector<int> selected_event_indices;
-	for (const QModelIndex &model_index : events_table->selectionModel()->selectedRows()) {
-		QTableWidgetItem *selected_item = events_table->item(model_index.row(), 0);
-		bool has_event_index = false;
-		const int event_index = selected_item ? selected_item->data(Qt::UserRole).toInt(&has_event_index) : -1;
-		if (!has_event_index || event_index < 0 || event_index >= replay_session->events().size()) {
-			playout_status->setText("The selected replay event is no longer available.");
-			return;
+	for (const int event_index : event_indices) {
+		if (event_index < 0 || event_index >= replay_session->events().size()) {
+			*error = "A requested replay event is no longer available.";
+			return false;
 		}
-		selected_event_indices.append(event_index);
-	}
-	std::sort(selected_event_indices.begin(), selected_event_indices.end());
-	for (const int event_index : selected_event_indices) {
 		const obs_replays::ReplayEvent &event = replay_session->events().at(event_index);
 		const QString recording_path = replay_session->recordingPath(event.takeId);
 		if (!QFileInfo::exists(recording_path)) {
-			playout_status->setText("The recording take for a selected replay event is not available.");
-			return;
+			*error = "The recording take for a requested replay event is not available.";
+			return false;
 		}
-		queue.append({recording_path, event.inUs / 1000,
+		queue.append({event.id.toString(QUuid::WithoutBraces), recording_path, event.inUs / 1000,
 			      (event.outUs - event.inUs) / 1000,
 			      event.label.isEmpty() ? "Replay event" : event.label});
 	}
 
-	QString error;
-	if (!take_replay_to_program(&error)) {
-		playout_status->setText(error);
-		return;
-	}
+	if (!take_replay_to_program(error))
+		return false;
 	update_playout_button();
 	replay_playout_queue = queue;
 	replay_playout_index = -1;
@@ -1307,9 +1440,344 @@ void play_selected_replay_events()
 		channel->reset();
 		channel->setPlaybackSpeed(playback_speed_percent());
 	}
-	if (!play_next_replay_event(&error))
+	const bool started = play_next_replay_event(error);
+	if (started)
+		emit_websocket_event("PlayoutStarted");
+	return started;
+}
+
+void play_selected_replay_events()
+{
+	if (!events_table || events_table->selectionModel()->selectedRows().isEmpty()) {
+		playout_status->setText("Select one or more replay events first.");
+		return;
+	}
+
+	QVector<int> selected_event_indices;
+	for (const QModelIndex &model_index : events_table->selectionModel()->selectedRows()) {
+		QTableWidgetItem *selected_item = events_table->item(model_index.row(), 0);
+		bool has_event_index = false;
+		const int event_index = selected_item ? selected_item->data(Qt::UserRole).toInt(&has_event_index) : -1;
+		if (!has_event_index) {
+			playout_status->setText("The selected replay event is no longer available.");
+			return;
+		}
+		selected_event_indices.append(event_index);
+	}
+	std::sort(selected_event_indices.begin(), selected_event_indices.end());
+	QString error;
+	if (!play_replay_event_indices(selected_event_indices, &error))
 		playout_status->setText(error);
 }
+
+bool stop_replay_playout(QString *error)
+{
+	if (outro_cleanup_pending) {
+		*error = "Replay playout is already ending.";
+		return false;
+	}
+	if (!active_replay_scene) {
+		*error = "There is no active replay playout.";
+		return false;
+	}
+	const bool stopping = return_to_previous_program(error);
+	if (stopping)
+		emit_websocket_event("PlayoutStopping");
+	return stopping;
+}
+
+int replay_event_index_from_id(const QString &id)
+{
+	if (!replay_session)
+		return -1;
+	const QUuid requested_id(id);
+	if (requested_id.isNull())
+		return -1;
+	for (qsizetype index = 0; index < replay_session->events().size(); ++index) {
+		if (replay_session->events().at(index).id == requested_id)
+			return static_cast<int>(index);
+	}
+	return -1;
+}
+
+void write_websocket_success(obs_data_t *response)
+{
+	obs_data_set_int(response, "protocolVersion", 1);
+	obs_data_set_bool(response, "success", true);
+}
+
+void write_websocket_error(obs_data_t *response, const QString &error)
+{
+	obs_data_set_int(response, "protocolVersion", 1);
+	obs_data_set_bool(response, "success", false);
+	set_websocket_string(response, "error", error);
+}
+
+void write_get_playout_status_response(obs_data_t *, obs_data_t *response)
+{
+	write_websocket_success(response);
+	const bool active = active_replay_scene != nullptr;
+	obs_data_set_bool(response, "active", active);
+	obs_data_set_bool(response, "ending", outro_cleanup_pending);
+	obs_data_set_int(response, "playbackRatePercent", playback_speed_percent());
+	obs_data_set_int(response, "queueLength", replay_playout_queue.size());
+	obs_data_set_int(response, "currentQueueIndex", replay_playout_index + 1);
+	if (replay_playout_index >= 0 && replay_playout_index < replay_playout_queue.size()) {
+		set_websocket_string(response, "currentEventId", replay_playout_queue.at(replay_playout_index).eventId);
+		set_websocket_string(response, "currentLabel", replay_playout_queue.at(replay_playout_index).label);
+	}
+}
+
+void write_get_event_response(obs_data_t *request, obs_data_t *response)
+{
+	const QString id = QString::fromUtf8(obs_data_get_string(request, "eventId"));
+	const int index = replay_event_index_from_id(id);
+	if (index < 0) {
+		write_websocket_error(response, "The requested replay event was not found.");
+		return;
+	}
+	write_websocket_success(response);
+	obs_data_t *event = obs_data_create();
+	write_websocket_event(event, replay_session->events().at(index), index);
+	obs_data_set_obj(response, "event", event);
+	obs_data_release(event);
+}
+
+void write_start_recording_response(obs_data_t *, obs_data_t *response)
+{
+	start_recording_session();
+	if (!replay_session || !replay_session->isActive() || !segment_writer || !segment_writer->isActive()) {
+		write_websocket_error(response, recording_status ? recording_status->text()
+								 : "OBS could not start replay recording.");
+		return;
+	}
+	write_websocket_success(response);
+	write_websocket_recording_status(response);
+}
+
+void write_stop_recording_response(obs_data_t *, obs_data_t *response)
+{
+	if (!segment_writer || !segment_writer->isActive()) {
+		write_websocket_error(response, "There is no active replay recording take.");
+		return;
+	}
+	stop_recording_session();
+	write_websocket_success(response);
+	obs_data_set_bool(response, "stopping", true);
+	write_websocket_recording_status(response);
+}
+
+void write_create_event_response(obs_data_t *request, obs_data_t *response)
+{
+	if (!replay_session || !replay_session->isActive() || !source_capture) {
+		write_websocket_error(response, "Start recording before creating a replay event.");
+		return;
+	}
+	if (!obs_data_has_user_value(request, "inMs") || !obs_data_has_user_value(request, "outMs")) {
+		write_websocket_error(response, "CreateEvent requires inMs and outMs.");
+		return;
+	}
+	const qint64 in_ms = obs_data_get_int(request, "inMs");
+	const qint64 out_ms = obs_data_get_int(request, "outMs");
+	if (in_ms < 0 || out_ms <= in_ms) {
+		write_websocket_error(response, "The replay event range is invalid.");
+		return;
+	}
+	replay_session->updateLiveTimeline(static_cast<obs_replays::TimelineUs>(source_capture->timelineUs()));
+	const QString label = obs_data_has_user_value(request, "label")
+			      ? QString::fromUtf8(obs_data_get_string(request, "label"))
+			      : QString("Event %1").arg(replay_session->events().size() + 1);
+	QString error;
+	if (!replay_session->addEvent(in_ms * 1000, out_ms * 1000, label, &error)) {
+		write_websocket_error(response, error);
+		return;
+	}
+	refresh_events_list();
+	emit_websocket_event("EventListChanged");
+	write_websocket_success(response);
+	obs_data_t *event = obs_data_create();
+	write_websocket_event(event, replay_session->events().last(), replay_session->events().size() - 1);
+	obs_data_set_obj(response, "event", event);
+	obs_data_release(event);
+}
+
+void write_create_event_from_live_response(obs_data_t *request, obs_data_t *response)
+{
+	if (!replay_session || !replay_session->isActive() || !source_capture) {
+		write_websocket_error(response, "Start recording before creating a replay event.");
+		return;
+	}
+	if (!obs_data_has_user_value(request, "preRollMs")) {
+		write_websocket_error(response, "CreateEventFromLive requires preRollMs.");
+		return;
+	}
+	const qint64 pre_roll_ms = obs_data_get_int(request, "preRollMs");
+	if (pre_roll_ms <= 0) {
+		write_websocket_error(response, "preRollMs must be greater than zero.");
+		return;
+	}
+	const obs_replays::TimelineUs now = static_cast<obs_replays::TimelineUs>(source_capture->timelineUs());
+	replay_session->updateLiveTimeline(now);
+	const obs_replays::TimelineUs in = qMax<obs_replays::TimelineUs>(0, now - pre_roll_ms * 1000);
+	if (now <= in) {
+		write_websocket_error(response, "The recording has not yet reached the requested event duration.");
+		return;
+	}
+	const QString label = obs_data_has_user_value(request, "label")
+			      ? QString::fromUtf8(obs_data_get_string(request, "label"))
+			      : QString("Event %1").arg(replay_session->events().size() + 1);
+	QString error;
+	if (!replay_session->addEvent(in, now, label, &error)) {
+		write_websocket_error(response, error);
+		return;
+	}
+	refresh_events_list();
+	emit_websocket_event("EventListChanged");
+	write_websocket_success(response);
+	obs_data_t *event = obs_data_create();
+	write_websocket_event(event, replay_session->events().last(), replay_session->events().size() - 1);
+	obs_data_set_obj(response, "event", event);
+	obs_data_release(event);
+}
+
+void write_update_event_response(obs_data_t *request, obs_data_t *response)
+{
+	const QString id = QString::fromUtf8(obs_data_get_string(request, "eventId"));
+	const int index = replay_event_index_from_id(id);
+	if (index < 0) {
+		write_websocket_error(response, "The requested replay event was not found.");
+		return;
+	}
+	if (!obs_data_has_user_value(request, "inMs") || !obs_data_has_user_value(request, "outMs")) {
+		write_websocket_error(response, "UpdateEvent requires inMs and outMs.");
+		return;
+	}
+	const qint64 in_ms = obs_data_get_int(request, "inMs");
+	const qint64 out_ms = obs_data_get_int(request, "outMs");
+	const QString label = obs_data_has_user_value(request, "label")
+			      ? QString::fromUtf8(obs_data_get_string(request, "label"))
+			      : replay_session->events().at(index).label;
+	QString error;
+	if (!replay_session->updateEvent(index, in_ms * 1000, out_ms * 1000, label, &error)) {
+		write_websocket_error(response, error);
+		return;
+	}
+	refresh_events_list();
+	emit_websocket_event("EventListChanged");
+	write_websocket_success(response);
+	obs_data_t *event = obs_data_create();
+	write_websocket_event(event, replay_session->events().at(index), index);
+	obs_data_set_obj(response, "event", event);
+	obs_data_release(event);
+}
+
+void write_delete_event_response(obs_data_t *request, obs_data_t *response)
+{
+	const QString id = QString::fromUtf8(obs_data_get_string(request, "eventId"));
+	const int index = replay_event_index_from_id(id);
+	if (index < 0) {
+		write_websocket_error(response, "The requested replay event was not found.");
+		return;
+	}
+	QString error;
+	if (!replay_session->removeEvent(index, &error)) {
+		write_websocket_error(response, error);
+		return;
+	}
+	refresh_events_list();
+	emit_websocket_event("EventListChanged");
+	write_websocket_success(response);
+	set_websocket_string(response, "eventId", id);
+}
+
+void write_start_playout_response(obs_data_t *request, obs_data_t *response)
+{
+	if (active_replay_scene || outro_cleanup_pending) {
+		write_websocket_error(response, "Replay playout is already active.");
+		return;
+	}
+	obs_data_array_t *event_ids = obs_data_get_array(request, "eventIds");
+	if (!event_ids || obs_data_array_count(event_ids) == 0) {
+		if (event_ids)
+			obs_data_array_release(event_ids);
+		write_websocket_error(response, "StartPlayout requires one or more eventIds.");
+		return;
+	}
+	QVector<int> event_indices;
+	for (size_t index = 0; index < obs_data_array_count(event_ids); ++index) {
+		obs_data_t *item = obs_data_array_item(event_ids, index);
+		const int event_index = item ? replay_event_index_from_id(
+			QString::fromUtf8(obs_data_get_string(item, "eventId"))) : -1;
+		if (item)
+			obs_data_release(item);
+		if (event_index < 0) {
+			obs_data_array_release(event_ids);
+			write_websocket_error(response, "A requested replay event was not found.");
+			return;
+		}
+		event_indices.append(event_index);
+	}
+	obs_data_array_release(event_ids);
+	QString error;
+	if (!play_replay_event_indices(event_indices, &error)) {
+		write_websocket_error(response, error);
+		return;
+	}
+	write_get_playout_status_response(nullptr, response);
+}
+
+void write_stop_playout_response(obs_data_t *, obs_data_t *response)
+{
+	QString error;
+	if (!stop_replay_playout(&error)) {
+		write_websocket_error(response, error);
+		return;
+	}
+	write_websocket_success(response);
+	obs_data_set_bool(response, "stopping", true);
+}
+
+void write_set_playout_rate_response(obs_data_t *request, obs_data_t *response)
+{
+	if (!obs_data_has_user_value(request, "ratePercent")) {
+		write_websocket_error(response, "SetPlayoutRate requires ratePercent.");
+		return;
+	}
+	const int rate = static_cast<int>(obs_data_get_int(request, "ratePercent"));
+	if (rate < 10 || rate > 100) {
+		write_websocket_error(response, "ratePercent must be between 10 and 100.");
+		return;
+	}
+	if (playback_speed_selector)
+		playback_speed_selector->setValue(rate);
+	else
+		update_playback_speed(rate);
+	emit_websocket_event("PlayoutRateChanged");
+	write_websocket_success(response);
+	obs_data_set_int(response, "ratePercent", rate);
+}
+
+constexpr const char *websocket_request_types[] = {
+	"GetSession", "GetRecordingStatus", "GetPlayoutStatus", "ListEvents", "GetEvent",
+	"StartRecording", "StopRecording", "CreateEvent", "CreateEventFromLive", "UpdateEvent",
+	"DeleteEvent", "StartPlayout", "StopPlayout", "SetPlayoutRate",
+};
+WebsocketResponseWriter websocket_response_writers[] = {
+	write_get_session_response,
+	write_get_recording_status_response,
+	write_get_playout_status_response,
+	write_list_events_response,
+	write_get_event_response,
+	write_start_recording_response,
+	write_stop_recording_response,
+	write_create_event_response,
+	write_create_event_from_live_response,
+	write_update_event_response,
+	write_delete_event_response,
+	write_start_playout_response,
+	write_stop_playout_response,
+	write_set_playout_rate_response,
+};
 
 void reopen_saved_replay_session()
 {
@@ -1331,6 +1799,7 @@ void reopen_saved_replay_session()
 	if (!session->open(configuration, &error))
 		return;
 	replay_session = std::move(session);
+	emit_websocket_event("SessionChanged");
 	recording_status->setText(QString("Reopened replay session with %1 event%2 and %3 take%4.")
 					 .arg(replay_session->events().size())
 					 .arg(replay_session->events().size() == 1 ? "" : "s")
@@ -1355,6 +1824,7 @@ void change_replay_folder()
 	replay_session.reset();
 	reopen_saved_replay_session();
 	refresh_events_list();
+	emit_websocket_event("SessionChanged");
 	if (!replay_session)
 		recording_status->setText("No replay session in the selected folder.");
 }
@@ -1562,7 +2032,7 @@ QWidget *create_replay_dock()
 			return;
 		if (active_replay_scene) {
 			QString error;
-			if (!return_to_previous_program(&error))
+			if (!stop_replay_playout(&error))
 				playout_status->setText(error);
 			return;
 		}
@@ -1702,9 +2172,33 @@ bool obs_module_load(void)
 	return true;
 }
 
+void obs_module_post_load(void)
+{
+	websocket_vendor = obs_replays_websocket_register_vendor("obs-replays");
+	if (!websocket_vendor) {
+		obs_log(LOG_INFO, "OBS Replays: obs-websocket Vendor API unavailable; external control is disabled.");
+		return;
+	}
+
+	for (size_t index = 0; index < std::size(websocket_request_types); ++index) {
+		if (!obs_replays_websocket_register_request(websocket_vendor, websocket_request_types[index],
+							    websocket_request_callback,
+							    &websocket_response_writers[index])) {
+			obs_log(LOG_WARNING, "OBS Replays: could not register obs-websocket request '%s'.",
+				websocket_request_types[index]);
+		}
+	}
+	obs_log(LOG_INFO, "OBS Replays: obs-websocket vendor API registered.");
+}
+
 void obs_module_unload(void)
 {
 	flush_scheduled_settings_save();
+	// obs-websocket can be unloaded before this module during OBS shutdown. Its
+	// Vendor API has no vendor-unregister operation and owns vendor lifetime, so
+	// calling a cached process handler here can dereference an already destroyed
+	// mutex. Stop future emits locally and let obs-websocket release its vendor.
+	websocket_vendor = nullptr;
 	module_unloading = true;
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
 	close_recording_session_for_shutdown();

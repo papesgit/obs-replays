@@ -50,6 +50,9 @@ public:
 
 	bool isActive() const;
 	TimelineUs latestTimelineUs() const;
+	QString sessionId() const;
+	QUuid activeTakeId() const;
+	const SessionConfiguration &sessionConfiguration() const;
 	const QString &sessionDirectory() const;
 	QString recordingPath() const;
 	QString recordingPath(const QUuid &takeId) const;
