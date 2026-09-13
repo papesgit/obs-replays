@@ -53,6 +53,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 #include <QWidget>
 #include <QVector>
 
@@ -116,6 +117,22 @@ public:
 
 protected:
 	QSplitterHandle *createHandle() override { return new Handle(this); }
+};
+
+class DockSpinBox final : public QSpinBox {
+public:
+	using QSpinBox::QSpinBox;
+
+protected:
+	void wheelEvent(QWheelEvent *event) override { event->ignore(); }
+};
+
+class DockSlider final : public QSlider {
+public:
+	using QSlider::QSlider;
+
+protected:
+	void wheelEvent(QWheelEvent *event) override { event->ignore(); }
 };
 
 constexpr const char *dock_id = "obs-replays.dock";
@@ -1916,13 +1933,13 @@ QWidget *create_replay_dock()
 	replay_folder_layout->addWidget(choose_replay_folder_button);
 	capture_form->addRow("Replay folder", replay_folder_row);
 
-	video_bitrate_selector = new QSpinBox(capture_group);
+	video_bitrate_selector = new DockSpinBox(capture_group);
 	video_bitrate_selector->setRange(1, 250);
 	video_bitrate_selector->setValue(25);
 	video_bitrate_selector->setSuffix(" Mb/s");
 	capture_form->addRow("Target video bitrate", video_bitrate_selector);
 
-	audio_bitrate_selector = new QSpinBox(capture_group);
+	audio_bitrate_selector = new DockSpinBox(capture_group);
 	audio_bitrate_selector->setRange(32, 512);
 	audio_bitrate_selector->setValue(160);
 	audio_bitrate_selector->setSuffix(" kb/s");
@@ -1986,7 +2003,7 @@ QWidget *create_replay_dock()
 	between_events_transition_selector->addItem("Fade", "fade");
 	between_events_transition_selector->setCurrentIndex(1);
 	playout_form->addRow("Between replay events", between_events_transition_selector);
-	between_events_fade_duration_selector = new QSpinBox(playout_group);
+	between_events_fade_duration_selector = new DockSpinBox(playout_group);
 	between_events_fade_duration_selector->setRange(50, 2000);
 	between_events_fade_duration_selector->setValue(150);
 	between_events_fade_duration_selector->setSuffix(" ms");
@@ -2055,7 +2072,7 @@ QWidget *create_replay_dock()
 	auto *speed_layout = new QHBoxLayout(speed_row);
 	speed_layout->setContentsMargins(0, 0, 0, 0);
 	auto *speed_label = new QLabel("Playback speed", speed_row);
-	playback_speed_selector = new QSlider(Qt::Horizontal, speed_row);
+	playback_speed_selector = new DockSlider(Qt::Horizontal, speed_row);
 	playback_speed_selector->setRange(10, 100);
 	playback_speed_selector->setValue(100);
 	playback_speed_selector->setTickInterval(10);
