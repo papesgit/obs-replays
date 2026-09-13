@@ -191,6 +191,19 @@ Request data: `{}`. Immediately starts the configured outro transition. On accep
 
 Sets speed from `10` through `100` percent. It applies immediately to active playout and is used for subsequent playout until changed. It is not persisted across an OBS restart. Returns the accepted `ratePercent`.
 
+### `SetPlayoutRateSmooth`
+
+```json
+{
+  "ratePercent": 50,
+  "durationMs": 500
+}
+```
+
+Animates from the current rate to `ratePercent` over `durationMs` milliseconds. `ratePercent` must be from `10` through `100`; `durationMs` must be from `0` through `600000` (ten minutes). A duration of `0` applies the new rate immediately.
+
+A new immediate or smooth rate request, or an operator adjustment of the playback-speed slider, cancels an in-progress animation and uses the current rate as its new starting point. The request returns `startingRatePercent`, target `ratePercent`, and `durationMs`. `PlayoutRateChanged` is emitted when the requested target rate is reached.
+
 ## Vendor events
 
 Identify with the normal obs-websocket `Vendors` subscription intent (`512`). OBS will then send normal `VendorEvent` messages. Filter for `vendorName: "obs-replays"`; `eventType` is one of:

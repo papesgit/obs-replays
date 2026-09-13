@@ -186,6 +186,12 @@ bool replay_scene_change_in_progress = false;
 QTimer *event_playout_timer = nullptr;
 double event_playout_remaining_media_milliseconds = 0.0;
 uint64_t event_playout_last_tick_ns = 0;
+QTimer *playback_rate_animation_timer = nullptr;
+int playback_rate_animation_start_percent = 100;
+int playback_rate_animation_target_percent = 100;
+uint64_t playback_rate_animation_start_ns = 0;
+uint64_t playback_rate_animation_duration_ns = 0;
+bool playback_rate_animation_applying = false;
 
 struct ReplayPlayoutItem {
 	QString eventId;
@@ -376,6 +382,48 @@ void update_playback_speed(int percent)
 			    active_replay_playback_source))
 			channel->setPlaybackSpeed(percent);
 	}
+}
+
+void cancel_playback_rate_animation()
+{
+	if (playback_rate_animation_timer)
+		playback_rate_animation_timer->stop();
+	playback_rate_animation_start_ns = 0;
+	playback_rate_animation_duration_ns = 0;
+}
+
+void update_playback_rate_animation()
+{
+	if (!playback_rate_animation_timer || !playback_rate_animation_timer->isActive() ||
+	    !playback_rate_animation_duration_ns)
+		return;
+
+	const uint64_t elapsed_ns = os_gettime_ns() - playback_rate_animation_start_ns;
+	const double progress = std::min(1.0, static_cast<double>(elapsed_ns) /
+						     playback_rate_animation_duration_ns);
+	const int rate = static_cast<int>(std::lround(
+		playback_rate_animation_start_percent +
+		(playback_rate_animation_target_percent - playback_rate_animation_start_percent) * progress));
+	playback_rate_animation_applying = true;
+	if (playback_speed_selector)
+		playback_speed_selector->setValue(rate);
+	else
+		update_playback_speed(rate);
+	playback_rate_animation_applying = false;
+
+	if (progress >= 1.0) {
+		playback_rate_animation_timer->stop();
+		playback_rate_animation_start_ns = 0;
+		playback_rate_animation_duration_ns = 0;
+		emit_websocket_event("PlayoutRateChanged");
+	}
+}
+
+void set_playback_speed_from_operator(int percent)
+{
+	if (!playback_rate_animation_applying)
+		cancel_playback_rate_animation();
+	update_playback_speed(percent);
 }
 
 void update_event_playout_timer()
@@ -768,6 +816,7 @@ void flush_scheduled_settings_save()
 void clear_playout_state()
 {
 	++playback_generation;
+	cancel_playback_rate_animation();
 	if (!module_unloading && event_playout_timer)
 		event_playout_timer->stop();
 	event_playout_remaining_media_milliseconds = 0.0;
@@ -1777,6 +1826,7 @@ void write_set_playout_rate_response(obs_data_t *request, obs_data_t *response)
 		write_websocket_error(response, "ratePercent must be between 10 and 100.");
 		return;
 	}
+	cancel_playback_rate_animation();
 	if (playback_speed_selector)
 		playback_speed_selector->setValue(rate);
 	else
@@ -1786,10 +1836,51 @@ void write_set_playout_rate_response(obs_data_t *request, obs_data_t *response)
 	obs_data_set_int(response, "ratePercent", rate);
 }
 
+void write_set_playout_rate_smooth_response(obs_data_t *request, obs_data_t *response)
+{
+	if (!obs_data_has_user_value(request, "ratePercent") ||
+	    !obs_data_has_user_value(request, "durationMs")) {
+		write_websocket_error(response,
+			"SetPlayoutRateSmooth requires ratePercent and durationMs.");
+		return;
+	}
+	const int rate = static_cast<int>(obs_data_get_int(request, "ratePercent"));
+	const qint64 duration_ms = obs_data_get_int(request, "durationMs");
+	if (rate < 10 || rate > 100) {
+		write_websocket_error(response, "ratePercent must be between 10 and 100.");
+		return;
+	}
+	if (duration_ms < 0 || duration_ms > 600000) {
+		write_websocket_error(response, "durationMs must be between 0 and 600000.");
+		return;
+	}
+
+	const int starting_rate = playback_speed_percent();
+	cancel_playback_rate_animation();
+	if (duration_ms == 0 || starting_rate == rate || !playback_rate_animation_timer) {
+		if (playback_speed_selector)
+			playback_speed_selector->setValue(rate);
+		else
+			update_playback_speed(rate);
+		emit_websocket_event("PlayoutRateChanged");
+	} else {
+		playback_rate_animation_start_percent = starting_rate;
+		playback_rate_animation_target_percent = rate;
+		playback_rate_animation_start_ns = os_gettime_ns();
+		playback_rate_animation_duration_ns = static_cast<uint64_t>(duration_ms) * 1000000ULL;
+		playback_rate_animation_timer->start();
+	}
+
+	write_websocket_success(response);
+	obs_data_set_int(response, "startingRatePercent", starting_rate);
+	obs_data_set_int(response, "ratePercent", rate);
+	obs_data_set_int(response, "durationMs", duration_ms);
+}
+
 constexpr const char *websocket_request_types[] = {
 	"GetSession", "GetRecordingStatus", "GetPlayoutStatus", "ListEvents", "GetEvent",
 	"StartRecording", "StopRecording", "CreateEvent", "CreateEventFromLive", "UpdateEvent",
-	"DeleteEvent", "StartPlayout", "StopPlayout", "SetPlayoutRate",
+	"DeleteEvent", "StartPlayout", "StopPlayout", "SetPlayoutRate", "SetPlayoutRateSmooth",
 };
 WebsocketResponseWriter websocket_response_writers[] = {
 	write_get_session_response,
@@ -1806,6 +1897,7 @@ WebsocketResponseWriter websocket_response_writers[] = {
 	write_start_playout_response,
 	write_stop_playout_response,
 	write_set_playout_rate_response,
+	write_set_playout_rate_smooth_response,
 };
 
 void reopen_saved_replay_session()
@@ -2083,7 +2175,7 @@ QWidget *create_replay_dock()
 	speed_layout->addWidget(playback_speed_value);
 	events_layout->addWidget(speed_row);
 	QObject::connect(playback_speed_selector, &QSlider::valueChanged,
-			 [](int percent) { update_playback_speed(percent); });
+			 [](int percent) { set_playback_speed_from_operator(percent); });
 	auto *events_splitter = new EventTableSplitter(events_group);
 	events_table = new QTableWidget(events_splitter);
 	events_table->setColumnCount(4);
@@ -2134,6 +2226,10 @@ QWidget *create_replay_dock()
 	event_playout_timer->setInterval(20);
 	QObject::connect(event_playout_timer, &QTimer::timeout,
 			 []() { update_event_playout_timer(); });
+	playback_rate_animation_timer = new QTimer(events_group);
+	playback_rate_animation_timer->setInterval(16);
+	QObject::connect(playback_rate_animation_timer, &QTimer::timeout,
+			 []() { update_playback_rate_animation(); });
 	// Let the event table own any spare dock height so its splitter can grow
 	// upward as well as shrink. A trailing layout stretch would consume it.
 	layout->addWidget(events_group, 1);
@@ -2260,5 +2356,6 @@ void obs_module_unload(void)
 	recording_timer = nullptr;
 	settings_save_timer = nullptr;
 	event_playout_timer = nullptr;
+	playback_rate_animation_timer = nullptr;
 	obs_log(LOG_INFO, "OBS Replays unloaded");
 }
