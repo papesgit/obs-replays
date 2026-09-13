@@ -208,4 +208,4 @@ Every event includes `eventData` with `protocolVersion: 1` and the current sessi
 
 ## Current scope
 
-The current engine intentionally has no seek, preview, pause/resume, source-selection, replay-folder management, or deferred post-roll event requests. It records one configured source; every event belongs to one recording take and cannot span takes.
+The current engine intentionally has no seek, preview, pause/resume, source-selection, replay-folder management, or deferred post-roll event requests. Each recording take captures one configured source, but later stopped takes in the same session may use another source. Every event belongs to one recording take and cannot span takes.

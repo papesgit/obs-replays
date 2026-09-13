@@ -29,6 +29,8 @@ struct ReplayEvent {
 struct ReplayTake {
 	QUuid id;
 	QString recordingRelativePath;
+	QString sourceName;
+	QString sourceUuid;
 	TimelineUs durationUs = 0;
 	QDateTime startedAtUtc;
 	QDateTime stoppedAtUtc;

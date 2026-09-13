@@ -26,6 +26,7 @@ QJsonObject toJson(const ReplayTake &take)
 {
 	return {{"id", take.id.toString(QUuid::WithoutBraces)},
 		{"path", take.recordingRelativePath},
+		{"source", QJsonObject{{"name", take.sourceName}, {"uuid", take.sourceUuid}}},
 		{"durationUs", QString::number(take.durationUs)},
 		{"startedAtUtc", take.startedAtUtc.toString(Qt::ISODateWithMs)},
 		{"stoppedAtUtc", take.stoppedAtUtc.toString(Qt::ISODateWithMs)}};
@@ -56,9 +57,6 @@ bool ReplaySession::start(const SessionConfiguration &sessionConfiguration, QStr
 	if (directory.isEmpty()) {
 		if (!openMostRecentSession(sessionConfiguration, error) && !createSession(sessionConfiguration, error))
 			return false;
-	} else if (configuration.sourceUuid != sessionConfiguration.sourceUuid) {
-		*error = "This replay session belongs to a different source. Choose a new replay folder to begin a new session.";
-		return false;
 	}
 	if (!QDir().mkpath(QDir(directory).filePath("takes"))) {
 		*error = "Could not create the replay take folder.";
@@ -68,7 +66,13 @@ bool ReplaySession::start(const SessionConfiguration &sessionConfiguration, QStr
 	ReplayTake take;
 	take.id = QUuid::createUuid();
 	take.recordingRelativePath = QString("takes/take-%1.mp4").arg(replayTakes.size() + 1, 3, 10, QLatin1Char('0'));
+	take.sourceName = sessionConfiguration.sourceName;
+	take.sourceUuid = sessionConfiguration.sourceUuid;
 	take.startedAtUtc = QDateTime::currentDateTimeUtc();
+	// The session retains the most recently used capture configuration for
+	// presentation and legacy manifests. Source identity itself is immutable on
+	// each take, allowing later takes to use a different source safely.
+	configuration = sessionConfiguration;
 	replayTakes.append(take);
 	liveTimelineUs = 0;
 	stoppedAtUtc = {};
@@ -87,7 +91,7 @@ bool ReplaySession::open(const SessionConfiguration &sessionConfiguration, QStri
 		return false;
 	}
 	if (!directory.isEmpty())
-		return configuration.sourceUuid == sessionConfiguration.sourceUuid;
+		return true;
 	return openMostRecentSession(sessionConfiguration, error);
 }
 
@@ -194,11 +198,7 @@ bool ReplaySession::openMostRecentSession(const SessionConfiguration &sessionCon
 	for (const QFileInfo &candidate : candidates) {
 		if (!loadManifest(QDir(candidate.absoluteFilePath()).filePath("session.json"), error))
 			continue;
-		if (configuration.sourceUuid == sessionConfiguration.sourceUuid)
-			return true;
-		directory.clear();
-		replayEvents.clear();
-		replayTakes.clear();
+		return true;
 	}
 	return false;
 }
@@ -249,6 +249,9 @@ bool ReplaySession::loadManifest(const QString &manifestPath, QString *error)
 			return false;
 		take.startedAtUtc = QDateTime::fromString(object.value("startedAtUtc").toString(), Qt::ISODateWithMs);
 		take.stoppedAtUtc = QDateTime::fromString(object.value("stoppedAtUtc").toString(), Qt::ISODateWithMs);
+		const QJsonObject takeSource = object.value("source").toObject();
+		take.sourceName = takeSource.value("name").toString(loadedConfiguration.sourceName);
+		take.sourceUuid = takeSource.value("uuid").toString(loadedConfiguration.sourceUuid);
 		loadedTakes.append(take);
 	}
 	QList<ReplayEvent> loadedEvents;
