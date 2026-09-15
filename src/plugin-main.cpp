@@ -930,7 +930,7 @@ void schedule_settings_save()
 
 void flush_scheduled_settings_save()
 {
-	if (settings_save_timer && settings_save_timer->isActive()) {
+	if (!module_unloading && settings_save_timer && settings_save_timer->isActive()) {
 		settings_save_timer->stop();
 		save_settings();
 	}
@@ -2462,13 +2462,15 @@ void obs_module_post_load(void)
 
 void obs_module_unload(void)
 {
-	flush_scheduled_settings_save();
+	// OBS_FRONTEND_EVENT_EXIT flushes pending settings while the dock still
+	// exists. By module unload, OBS may already have destroyed its QTimer, so
+	// never touch cached Qt widget pointers here.
+	module_unloading = true;
 	// obs-websocket can be unloaded before this module during OBS shutdown. Its
 	// Vendor API has no vendor-unregister operation and owns vendor lifetime, so
 	// calling a cached process handler here can dereference an already destroyed
 	// mutex. Stop future emits locally and let obs-websocket release its vendor.
 	websocket_vendor = nullptr;
-	module_unloading = true;
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
 	close_recording_session_for_shutdown();
 	clear_playout_state();
