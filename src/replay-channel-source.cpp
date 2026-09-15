@@ -310,6 +310,73 @@ ReplayChannelSource::CachedAudioFrame ReplayChannelSource::cacheAudioFrame(
 	return copy;
 }
 
+namespace {
+template<typename Sample>
+void resample_audio_plane(const uint8_t *inputBytes, uint8_t *outputBytes, uint32_t inputFrames,
+			  uint32_t outputFrames, size_t channels, bool planar)
+{
+	const auto *input = reinterpret_cast<const Sample *>(inputBytes);
+	auto *output = reinterpret_cast<Sample *>(outputBytes);
+	const double step = static_cast<double>(inputFrames) / outputFrames;
+	const size_t samplesPerFrame = planar ? 1 : channels;
+	for (uint32_t outputFrame = 0; outputFrame < outputFrames; ++outputFrame) {
+		const double sourcePosition = outputFrame * step;
+		const uint32_t firstFrame = std::min<uint32_t>(
+			static_cast<uint32_t>(sourcePosition), inputFrames - 1);
+		const uint32_t secondFrame = std::min<uint32_t>(firstFrame + 1, inputFrames - 1);
+		const double fraction = sourcePosition - firstFrame;
+		for (size_t channel = 0; channel < samplesPerFrame; ++channel) {
+			const double first = input[firstFrame * samplesPerFrame + channel];
+			const double second = input[secondFrame * samplesPerFrame + channel];
+			output[outputFrame * samplesPerFrame + channel] =
+				static_cast<Sample>(first + (second - first) * fraction);
+		}
+	}
+}
+} // namespace
+
+ReplayChannelSource::CachedAudioFrame ReplayChannelSource::resampleAudioFrame(
+	const obs_source_audio *sourceAudio, int speedPercent)
+{
+	CachedAudioFrame output = {};
+	if (!sourceAudio || !sourceAudio->frames || !sourceAudio->samples_per_sec)
+		return output;
+
+	obs_audio_info outputInfo = {};
+	const uint32_t outputRate = obs_get_audio_info(&outputInfo) && outputInfo.samples_per_sec
+		? outputInfo.samples_per_sec
+		: sourceAudio->samples_per_sec;
+	const double sourceStep = static_cast<double>(sourceAudio->samples_per_sec) *
+		std::clamp(speedPercent, 10, 100) / (static_cast<double>(outputRate) * 100.0);
+	const uint32_t outputFrames = std::max<uint32_t>(1, static_cast<uint32_t>(std::llround(
+		sourceAudio->frames / sourceStep)));
+	if (sourceAudio->format != AUDIO_FORMAT_FLOAT && sourceAudio->format != AUDIO_FORMAT_FLOAT_PLANAR &&
+	    sourceAudio->format != AUDIO_FORMAT_16BIT && sourceAudio->format != AUDIO_FORMAT_16BIT_PLANAR)
+		return cacheAudioFrame(sourceAudio);
+
+	output.audio = *sourceAudio;
+	output.audio.samples_per_sec = outputRate;
+	output.audio.frames = outputFrames;
+	const bool planar = is_audio_planar(sourceAudio->format);
+	const size_t planes = get_audio_planes(sourceAudio->format, sourceAudio->speakers);
+	const size_t channels = get_audio_channels(sourceAudio->speakers);
+	for (size_t plane = 0; plane < planes; ++plane) {
+		if (!sourceAudio->data[plane])
+			return {};
+		output.data[plane].resize(get_audio_size(sourceAudio->format, sourceAudio->speakers,
+							   outputFrames));
+		if (sourceAudio->format == AUDIO_FORMAT_FLOAT ||
+		    sourceAudio->format == AUDIO_FORMAT_FLOAT_PLANAR)
+			resample_audio_plane<float>(sourceAudio->data[plane], output.data[plane].data(),
+						    sourceAudio->frames, outputFrames, channels, planar);
+		else
+			resample_audio_plane<int16_t>(sourceAudio->data[plane], output.data[plane].data(),
+						      sourceAudio->frames, outputFrames, channels, planar);
+		output.audio.data[plane] = output.data[plane].data();
+	}
+	return output;
+}
+
 bool ReplayChannelSource::blendAudioFrames(const CachedAudioFrame &outgoing,
 					   const CachedAudioFrame &incoming, float incomingGain,
 					   CachedAudioFrame &destination)
@@ -427,7 +494,7 @@ void ReplayChannelSource::outputTransitionVideo(int playerIndex, obs_source_fram
 	}
 }
 
-void ReplayChannelSource::outputTransitionAudio(int playerIndex, obs_source_audio *audio)
+void ReplayChannelSource::outputTransitionAudio(int playerIndex, CachedAudioFrame audio)
 {
 	CachedAudioFrame mixed = {};
 	bool outputMixed = false;
@@ -435,11 +502,10 @@ void ReplayChannelSource::outputTransitionAudio(int playerIndex, obs_source_audi
 		std::lock_guard lock(mutex);
 		if (fadingOutPlayer < 0)
 			return;
-		CachedAudioFrame cached = cacheAudioFrame(audio);
-		if (!cached.audio.frames)
+		if (!audio.audio.frames)
 			return;
 		auto &queue = pendingAudio[playerIndex];
-		queue.emplace_back(std::move(cached));
+		queue.emplace_back(std::move(audio));
 		if (queue.size() > 4)
 			queue.pop_front();
 		auto &outgoing = pendingAudio[fadingOutPlayer];
@@ -551,17 +617,22 @@ void ReplayChannelSource::receiveAudio(int playerIndex, obs_source_audio *audio)
 {
 	bool fading = false;
 	bool outputActive = false;
+	int speed = 100;
 	{
 		std::lock_guard lock(mutex);
 		fading = fadingOutPlayer >= 0;
 		outputActive = playerIndex == activePlayer && players[playerIndex].state == PlayerState::Playing;
+		speed = playbackSpeedPercent;
 	}
+	CachedAudioFrame resampled = resampleAudioFrame(audio, speed);
+	if (!resampled.audio.frames)
+		return;
 	if (fading) {
-		outputTransitionAudio(playerIndex, audio);
+		outputTransitionAudio(playerIndex, std::move(resampled));
 		return;
 	}
 	if (outputActive)
-		obs_source_output_audio(source, audio);
+		obs_source_output_audio(source, &resampled.audio);
 }
 
 } // namespace obs_replays

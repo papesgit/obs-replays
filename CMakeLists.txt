@@ -108,6 +108,24 @@ endif()
 string(REPLACE "${OBS_REPLAYS_ORIGINAL_SEEK_PRELOAD}"
                "${OBS_REPLAYS_EXACT_SEEK_PRELOAD}"
                OBS_REPLAYS_MEDIA_SOURCE "${OBS_REPLAYS_MEDIA_SOURCE}")
+
+# The upstream helper expresses playback speed by changing the advertised
+# audio sample rate. That is fine for a fixed rate, but live slider updates
+# repeatedly reconfigure OBS's source resampler and produce audible clicks.
+# Keep decoded audio at its native rate; the replay channel applies the
+# continuously changing resample ratio before submitting it to OBS.
+set(OBS_REPLAYS_ORIGINAL_AUDIO_SAMPLE_RATE
+    "audio.samples_per_sec = f->sample_rate * m->speed / 100;")
+set(OBS_REPLAYS_NATIVE_AUDIO_SAMPLE_RATE
+    "audio.samples_per_sec = f->sample_rate;")
+string(FIND "${OBS_REPLAYS_MEDIA_SOURCE}" "${OBS_REPLAYS_ORIGINAL_AUDIO_SAMPLE_RATE}"
+            OBS_REPLAYS_AUDIO_SAMPLE_RATE_OFFSET)
+if(OBS_REPLAYS_AUDIO_SAMPLE_RATE_OFFSET EQUAL -1)
+  message(FATAL_ERROR "Could not apply OBS Replays' stable audio-rate patch")
+endif()
+string(REPLACE "${OBS_REPLAYS_ORIGINAL_AUDIO_SAMPLE_RATE}"
+               "${OBS_REPLAYS_NATIVE_AUDIO_SAMPLE_RATE}"
+               OBS_REPLAYS_MEDIA_SOURCE "${OBS_REPLAYS_MEDIA_SOURCE}")
 file(WRITE "${OBS_REPLAYS_MEDIA_PLAYBACK_BUILD_DIR}/media.c"
      "${OBS_REPLAYS_MEDIA_SOURCE}")
 

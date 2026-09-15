@@ -82,11 +82,12 @@ private:
 	static bool blendVideoFrames(const CachedVideoFrame &outgoing, const CachedVideoFrame &incoming,
 				    float incomingOpacity, CachedVideoFrame &destination);
 	static CachedAudioFrame cacheAudioFrame(const obs_source_audio *source);
+	static CachedAudioFrame resampleAudioFrame(const obs_source_audio *source, int speedPercent);
 	static bool blendAudioFrames(const CachedAudioFrame &outgoing, const CachedAudioFrame &incoming,
 				    float incomingGain, CachedAudioFrame &destination);
 	float transitionProgressLocked(uint64_t nowNs) const;
 	void outputTransitionVideo(int playerIndex, obs_source_frame *frame);
-	void outputTransitionAudio(int playerIndex, obs_source_audio *audio);
+	void outputTransitionAudio(int playerIndex, CachedAudioFrame audio);
 
 	obs_source_t *source = nullptr;
 	ReplayChannel replayChannel;
