@@ -100,6 +100,8 @@ private:
 	std::mutex mutex;
 	int activePlayer = 0;
 	int playbackSpeedPercent = 100;
+	int deferredPlaybackSpeedPercent = 100;
+	bool hasDeferredPlaybackSpeed = false;
 	int fadingOutPlayer = -1;
 	uint64_t fadeStartNs = 0;
 	uint64_t fadeDurationNs = 0;

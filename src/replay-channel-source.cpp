@@ -89,6 +89,8 @@ void ReplayChannelSource::reset()
 			pendingAudio[index].clear();
 		}
 		activePlayer = 0;
+		deferredPlaybackSpeedPercent = playbackSpeedPercent;
+		hasDeferredPlaybackSpeed = false;
 		fadingOutPlayer = -1;
 		fadeStartNs = 0;
 		fadeDurationNs = 0;
@@ -132,6 +134,8 @@ bool ReplayChannelSource::takeCued(int fadeDurationMilliseconds, QString *error)
 			fadingOutPlayer = outgoingPlayer;
 			fadeStartNs = os_gettime_ns();
 			fadeDurationNs = static_cast<uint64_t>(fadeDurationMilliseconds) * 1000000ULL;
+			deferredPlaybackSpeedPercent = playbackSpeedPercent;
+			hasDeferredPlaybackSpeed = false;
 			// A player may still hold a frame from the preceding transition.
 			// Do not blend that stale image into this boundary; wait for its
 			// next decoded on-air frame instead.
@@ -162,6 +166,13 @@ void ReplayChannelSource::setPlaybackSpeed(int percent)
 	bool applySpeed = false;
 	{
 		std::lock_guard lock(mutex);
+		// Both lanes must retain one stable rate during an audio crossfade.
+		// Remember the latest requested value and apply it as the fade ends.
+		if (fadingOutPlayer >= 0) {
+			deferredPlaybackSpeedPercent = percent;
+			hasDeferredPlaybackSpeed = true;
+			return;
+		}
 		if (playbackSpeedPercent != percent) {
 			pendingAudio[0].clear();
 			pendingAudio[1].clear();
@@ -458,6 +469,8 @@ void ReplayChannelSource::outputTransitionVideo(int playerIndex, obs_source_fram
 {
 	CachedVideoFrame blended = {};
 	media_playback_t *decoderToPause = nullptr;
+	media_playback_t *decoderToRetune = nullptr;
+	int deferredSpeed = 100;
 	bool outputCurrent = false;
 	bool outputBlended = false;
 	{
@@ -480,11 +493,22 @@ void ReplayChannelSource::outputTransitionVideo(int playerIndex, obs_source_fram
 			fadingOutPlayer = -1;
 			fadeStartNs = 0;
 			fadeDurationNs = 0;
+			if (hasDeferredPlaybackSpeed) {
+				deferredSpeed = deferredPlaybackSpeedPercent;
+				hasDeferredPlaybackSpeed = false;
+				if (playbackSpeedPercent != deferredSpeed) {
+					playbackSpeedPercent = deferredSpeed;
+					pendingAudio[activePlayer].clear();
+					decoderToRetune = players[activePlayer].decoder;
+				}
+			}
 			outputCurrent = playerIndex == activePlayer;
 		}
 	}
 	if (decoderToPause)
 		media_playback_play_pause(decoderToPause, true);
+	if (decoderToRetune)
+		media_playback_set_speed(decoderToRetune, deferredSpeed);
 	if (outputBlended) {
 		obs_source_set_video_frame(source, &blended.frame);
 		obs_source_output_video(source, &blended.frame);
