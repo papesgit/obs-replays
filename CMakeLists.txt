@@ -158,6 +158,7 @@ target_sources(
           src/source-capture.h src/segment-writer.cpp src/segment-writer.h
           src/replay-channel-source.cpp src/replay-channel-source.h
           src/media-playback-runtime.c src/media-playback-runtime.h
+          data/obs-replays.qrc
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

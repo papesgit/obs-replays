@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/obs-replays">
+    <file alias="icons/event-order.svg">icons/event-order.svg</file>
+  </qresource>
+</RCC>

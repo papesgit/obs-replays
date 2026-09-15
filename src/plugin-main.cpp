@@ -36,11 +36,14 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QProgressBar>
+#include <QResizeEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -48,6 +51,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QSplitter>
 #include <QSplitterHandle>
 #include <QStorageInfo>
+#include <QShowEvent>
 #include <QStringList>
 #include <QTableWidget>
 #include <QTimer>
@@ -135,6 +139,62 @@ protected:
 	void wheelEvent(QWheelEvent *event) override { event->ignore(); }
 };
 
+class EventOrderHeader final : public QHeaderView {
+public:
+	using ToggleCallback = std::function<void()>;
+
+	explicit EventOrderHeader(QWidget *parent) : QHeaderView(Qt::Horizontal, parent)
+	{
+		button = new QToolButton(viewport());
+		button->setAutoRaise(true);
+		button->setIcon(QIcon(":/obs-replays/icons/event-order.svg"));
+		button->setIconSize(QSize(14, 14));
+		button->setFixedSize(22, 22);
+		QObject::connect(button, &QToolButton::clicked, [this]() {
+			if (toggle)
+				toggle();
+		});
+		QObject::connect(this, &QHeaderView::sectionResized,
+				 [this](int, int, int) { updateButtonGeometry(); });
+		QObject::connect(this, &QHeaderView::sectionMoved,
+				 [this](int, int, int) { updateButtonGeometry(); });
+	}
+
+	void setToggleCallback(ToggleCallback callback) { toggle = std::move(callback); }
+	void setNewestFirst(bool newestFirst)
+	{
+		button->setToolTip(newestFirst ? "Show oldest replay events first"
+					       : "Show newest replay events first");
+	}
+
+protected:
+	void resizeEvent(QResizeEvent *event) override
+	{
+		QHeaderView::resizeEvent(event);
+		updateButtonGeometry();
+	}
+	void showEvent(QShowEvent *event) override
+	{
+		QHeaderView::showEvent(event);
+		updateButtonGeometry();
+	}
+
+private:
+	void updateButtonGeometry()
+	{
+		constexpr int labelColumn = 3;
+		if (!button || labelColumn >= count())
+			return;
+		const int x = sectionViewportPosition(labelColumn) + sectionSize(labelColumn) -
+			      button->width() - 2;
+		button->move(x, (height() - button->height()) / 2);
+		button->raise();
+	}
+
+	QToolButton *button = nullptr;
+	ToggleCallback toggle;
+};
+
 constexpr const char *dock_id = "obs-replays.dock";
 constexpr const char *dock_title = "Replays";
 constexpr const char *settings_filename = "settings.json";
@@ -157,6 +217,7 @@ QSpinBox *between_events_fade_duration_selector = nullptr;
 QSlider *playback_speed_selector = nullptr;
 QLabel *playback_speed_value = nullptr;
 QLabel *playout_status = nullptr;
+QProgressBar *playout_progress = nullptr;
 QLabel *recording_status = nullptr;
 QLabel *storage_status = nullptr;
 QPushButton *start_recording_button = nullptr;
@@ -165,6 +226,8 @@ QVector<QPushButton *> mark_event_buttons;
 QPushButton *delete_events_button = nullptr;
 QPushButton *play_events_button = nullptr;
 QTableWidget *events_table = nullptr;
+EventOrderHeader *events_order_header = nullptr;
+bool events_newest_first = true;
 QTimer *recording_timer = nullptr;
 QTimer *settings_save_timer = nullptr;
 // OBS can destroy frontend dock widgets before calling obs_module_unload().
@@ -360,6 +423,57 @@ void update_playout_button()
 	}
 }
 
+QString format_playout_progress(qint64 milliseconds)
+{
+	milliseconds = std::max<qint64>(0, milliseconds);
+	const qint64 minutes = milliseconds / 60000;
+	const qint64 seconds = (milliseconds / 1000) % 60;
+	const qint64 remainder = milliseconds % 1000;
+	return QString("%1:%2:%3")
+		.arg(minutes, 2, 10, QLatin1Char('0'))
+		.arg(seconds, 2, 10, QLatin1Char('0'))
+		.arg(remainder, 3, 10, QLatin1Char('0'));
+}
+
+void update_event_playout_progress()
+{
+	// OBS may destroy frontend dock widgets before obs_module_unload(). Do not
+	// dereference their cached pointers during the remaining non-UI cleanup.
+	if (module_unloading || !playout_progress)
+		return;
+	if (!active_replay_scene || replay_playout_index < 0 ||
+	    replay_playout_index >= replay_playout_queue.size()) {
+		playout_progress->setValue(0);
+		playout_progress->setFormat("--:--:--- / --:--:---");
+		return;
+	}
+	qint64 total_duration = 0;
+	qint64 completed_duration = 0;
+	for (int index = 0; index < replay_playout_queue.size(); ++index) {
+		const qint64 duration = replay_playout_queue.at(index).durationMilliseconds;
+		total_duration += duration;
+		if (index < replay_playout_index)
+			completed_duration += duration;
+	}
+	const auto &item = replay_playout_queue.at(replay_playout_index);
+	// The first item's timer includes the media lead-in used to align its
+	// in-point with a stinger's transition point. That lead-in is deliberately
+	// outside the event itself, so subtracting the remaining media time alone
+	// keeps event and sequence progress at 00:00:000 until the real in-point.
+	const double event_elapsed = std::clamp(static_cast<double>(item.durationMilliseconds) -
+		event_playout_remaining_media_milliseconds, 0.0,
+		static_cast<double>(item.durationMilliseconds));
+	const qint64 elapsed = std::clamp(
+		completed_duration + static_cast<qint64>(event_elapsed), qint64{0}, total_duration);
+	const int value = total_duration > 0
+		? static_cast<int>(std::lround(static_cast<double>(elapsed) * 1000.0 / total_duration))
+		: 0;
+	playout_progress->setValue(std::clamp(value, 0, 1000));
+	playout_progress->setFormat(QString("%1 / %2")
+					.arg(format_playout_progress(elapsed))
+					.arg(format_playout_progress(total_duration)));
+}
+
 qint64 between_events_fade_duration_milliseconds()
 {
 	if (!between_events_transition_selector || !between_events_fade_duration_selector ||
@@ -446,6 +560,7 @@ void update_event_playout_timer()
 			elapsed_milliseconds * playback_speed_percent() / 100.0;
 	}
 	event_playout_last_tick_ns = now;
+	update_event_playout_progress();
 	const bool has_next_event = replay_playout_index >= 0 &&
 		replay_playout_index + 1 < replay_playout_queue.size();
 	const double transition_lead_media_milliseconds = has_next_event
@@ -745,6 +860,13 @@ void load_settings()
 		static_cast<int>(obs_data_get_int(collection_settings, "between_events_fade_duration_ms"));
 	if (fade_duration > 0)
 		between_events_fade_duration_selector->setValue(fade_duration);
+	// The original event list was oldest-first. Default new and existing
+	// collections to the operator-friendly newest-first presentation unless a
+	// collection has explicitly chosen the other order.
+	events_newest_first = !obs_data_has_user_value(collection_settings, "events_newest_first") ||
+		obs_data_get_bool(collection_settings, "events_newest_first");
+	if (events_order_header)
+		events_order_header->setNewestFirst(events_newest_first);
 	playback_speed_selector->setValue(100);
 	update_playback_speed(playback_speed_selector->value());
 
@@ -788,6 +910,7 @@ void save_settings()
 	obs_data_set_int(collection_settings, "between_events_fade_duration_ms",
 			 between_events_fade_duration_selector->value());
 	obs_data_erase(collection_settings, "playback_speed_percent");
+	obs_data_set_bool(collection_settings, "events_newest_first", events_newest_first);
 	obs_data_erase(collection_settings, "pre_roll_seconds");
 	obs_data_erase(collection_settings, "post_roll_seconds");
 
@@ -852,6 +975,7 @@ void clear_playout_state()
 	first_event_intro_lead_milliseconds = 0;
 	outro_cleanup_pending = false;
 	outro_transition_wait_generation = 0;
+	update_event_playout_progress();
 	update_playout_button();
 }
 
@@ -885,7 +1009,9 @@ void refresh_events_list()
 	const QSignalBlocker blocker(events_table);
 	events_table->setRowCount(0);
 	if (replay_session) {
-		for (qsizetype index = 0; index < replay_session->events().size(); ++index) {
+		const qsizetype count = replay_session->events().size();
+		for (qsizetype position = 0; position < count; ++position) {
+			const qsizetype index = events_newest_first ? count - position - 1 : position;
 			const obs_replays::ReplayEvent &event = replay_session->events().at(index);
 			const int row = events_table->rowCount();
 			events_table->insertRow(row);
@@ -1334,6 +1460,7 @@ void start_active_replay_event(void *data)
 	event_playout_remaining_media_milliseconds =
 		std::max(0.0, event_playout_remaining_media_milliseconds);
 	event_playout_last_tick_ns = os_gettime_ns();
+	update_event_playout_progress();
 	if (event_playout_timer)
 		event_playout_timer->start(20);
 	playout_status->setText(QString("Playing %1 (%2 of %3).").arg(item.label)
@@ -2147,6 +2274,13 @@ QWidget *create_replay_dock()
 
 	auto *events_group = new QGroupBox("Replay events", content);
 	auto *events_layout = new QVBoxLayout(events_group);
+	playout_progress = new QProgressBar(events_group);
+	playout_progress->setRange(0, 1000);
+	playout_progress->setTextVisible(true);
+	playout_progress->setAlignment(Qt::AlignCenter);
+	playout_progress->setFixedHeight(18);
+	playout_progress->setFormat("--:--:--- / --:--:---");
+	events_layout->addWidget(playout_progress);
 	play_events_button = new QPushButton("Play selected events", events_group);
 	QObject::connect(play_events_button, &QPushButton::clicked, []() {
 		if (outro_cleanup_pending)
@@ -2180,6 +2314,16 @@ QWidget *create_replay_dock()
 	events_table = new QTableWidget(events_splitter);
 	events_table->setColumnCount(4);
 	events_table->setHorizontalHeaderLabels({"#", "In", "Out", "Label"});
+	events_order_header = new EventOrderHeader(events_table);
+	events_order_header->setNewestFirst(events_newest_first);
+	events_order_header->setToggleCallback([]() {
+		events_newest_first = !events_newest_first;
+		if (events_order_header)
+			events_order_header->setNewestFirst(events_newest_first);
+		refresh_events_list();
+		schedule_settings_save();
+	});
+	events_table->setHorizontalHeader(events_order_header);
 	events_table->setSelectionBehavior(QAbstractItemView::SelectRows);
 	events_table->setSelectionMode(QAbstractItemView::ExtendedSelection);
 	events_table->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed |
@@ -2345,6 +2489,7 @@ void obs_module_unload(void)
 	playback_speed_selector = nullptr;
 	playback_speed_value = nullptr;
 	playout_status = nullptr;
+	playout_progress = nullptr;
 	recording_status = nullptr;
 	storage_status = nullptr;
 	start_recording_button = nullptr;
@@ -2353,6 +2498,7 @@ void obs_module_unload(void)
 	delete_events_button = nullptr;
 	play_events_button = nullptr;
 	events_table = nullptr;
+	events_order_header = nullptr;
 	recording_timer = nullptr;
 	settings_save_timer = nullptr;
 	event_playout_timer = nullptr;
