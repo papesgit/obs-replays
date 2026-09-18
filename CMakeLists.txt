@@ -83,8 +83,16 @@ set(OBS_REPLAYS_EXACT_SEEK_PRELOAD [=[
 	if (m->has_video && m->is_local_file) {
 		mp_decode_flush(&m->v);
 		if (m->seek_next_ts && m->pause && m->v_preload_cb) {
-			const int64_t seek_target_ns = pos * 1000;
-			while (mp_media_prepare_frames(m)) {
+			const int64_t seek_target_ns = av_rescale(
+				pos * 1000, 100, m->speed > 0 ? m->speed : 100);
+			for (;;) {
+				bool cancel_seek;
+				pthread_mutex_lock(&m->mutex);
+				cancel_seek = m->kill || m->stopping || !m->active;
+				pthread_mutex_unlock(&m->mutex);
+				if (cancel_seek || !mp_media_prepare_frames(m) ||
+				    !m->v.frame_ready)
+					break;
 				const bool video_at_target =
 					m->v.frame_ready && m->v.frame_pts >= seek_target_ns;
 				if (m->has_audio && m->a.frame_ready &&
@@ -107,6 +115,35 @@ if(OBS_REPLAYS_SEEK_PRELOAD_OFFSET EQUAL -1)
 endif()
 string(REPLACE "${OBS_REPLAYS_ORIGINAL_SEEK_PRELOAD}"
                "${OBS_REPLAYS_EXACT_SEEK_PRELOAD}"
+               OBS_REPLAYS_MEDIA_SOURCE "${OBS_REPLAYS_MEDIA_SOURCE}")
+
+# Upstream allocates or removes a packet from its pool before av_read_frame().
+# On EOF/error that packet must be returned, particularly because exact seek
+# preroll can reach EOF repeatedly while looking for a requested frame.
+set(OBS_REPLAYS_ORIGINAL_PACKET_READ_FAILURE [=[
+	int ret = av_read_frame(media->fmt, pkt);
+	if (ret < 0) {
+		if (ret != AVERROR_EOF && ret != AVERROR_EXIT)
+			blog(LOG_WARNING, "MP: av_read_frame failed: %s (%d)", av_err2str(ret), ret);
+		return ret;
+	}
+]=])
+set(OBS_REPLAYS_SAFE_PACKET_READ_FAILURE [=[
+	int ret = av_read_frame(media->fmt, pkt);
+	if (ret < 0) {
+		if (ret != AVERROR_EOF && ret != AVERROR_EXIT)
+			blog(LOG_WARNING, "MP: av_read_frame failed: %s (%d)", av_err2str(ret), ret);
+		mp_media_free_packet(media, pkt);
+		return ret;
+	}
+]=])
+string(FIND "${OBS_REPLAYS_MEDIA_SOURCE}" "${OBS_REPLAYS_ORIGINAL_PACKET_READ_FAILURE}"
+            OBS_REPLAYS_PACKET_READ_FAILURE_OFFSET)
+if(OBS_REPLAYS_PACKET_READ_FAILURE_OFFSET EQUAL -1)
+  message(FATAL_ERROR "Could not apply OBS Replays' packet cleanup patch")
+endif()
+string(REPLACE "${OBS_REPLAYS_ORIGINAL_PACKET_READ_FAILURE}"
+               "${OBS_REPLAYS_SAFE_PACKET_READ_FAILURE}"
                OBS_REPLAYS_MEDIA_SOURCE "${OBS_REPLAYS_MEDIA_SOURCE}")
 
 # The upstream helper expresses playback speed by changing the advertised

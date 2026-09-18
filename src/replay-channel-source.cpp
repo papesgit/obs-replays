@@ -4,14 +4,17 @@
 #include <util/platform.h>
 extern "C" {
 #include <media-playback/media-playback.h>
+#include "media-playback-runtime.h"
 void media_playback_set_speed(media_playback_t *playback, int speed);
-void media_playback_release_speed_state(media_playback_t *playback);
 }
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <thread>
 #include <utility>
 
 namespace obs_replays {
@@ -20,6 +23,72 @@ constexpr const char *channel_a_source_id = "obs_replays_channel_a";
 constexpr const char *channel_b_source_id = "obs_replays_channel_b";
 const char *get_channel_a_name(void *) { return "OBS Replays Channel A"; }
 const char *get_channel_b_name(void *) { return "OBS Replays Channel B"; }
+
+class DecoderCleanupQueue {
+public:
+	void enqueue(media_playback_t *decoder, std::shared_ptr<void> callbackLifetime)
+	{
+		if (!decoder)
+			return;
+		{
+			std::lock_guard lock(mutex);
+			if (!worker.joinable())
+				worker = std::thread([this]() { run(); });
+			items.push_back({decoder, std::move(callbackLifetime)});
+		}
+		condition.notify_one();
+	}
+
+	void shutdown()
+	{
+		{
+			std::lock_guard lock(mutex);
+			stopping = true;
+		}
+		condition.notify_one();
+		if (worker.joinable())
+			worker.join();
+	}
+
+	~DecoderCleanupQueue() { shutdown(); }
+
+private:
+	struct Item {
+		media_playback_t *decoder = nullptr;
+		std::shared_ptr<void> callbackLifetime;
+	};
+
+	void run()
+	{
+		for (;;) {
+			Item item;
+			{
+				std::unique_lock lock(mutex);
+				condition.wait(lock, [this]() { return stopping || !items.empty(); });
+				if (items.empty()) {
+					if (stopping)
+						return;
+					continue;
+				}
+				item = std::move(items.front());
+				items.pop_front();
+			}
+			obs_replays_destroy_media_playback(item.decoder);
+		}
+	}
+
+	std::mutex mutex;
+	std::condition_variable condition;
+	std::deque<Item> items;
+	std::thread worker;
+	bool stopping = false;
+};
+
+DecoderCleanupQueue &decoder_cleanup_queue()
+{
+	static DecoderCleanupQueue queue;
+	return queue;
+}
 
 uint32_t video_plane_rows(enum video_format format, uint32_t height, size_t plane)
 {
@@ -43,8 +112,6 @@ ReplayChannelSource::ReplayChannelSource(obs_source_t *source, ReplayChannel cha
 	// video, so this source owns that synchronisation directly.
 	obs_source_set_async_unbuffered(source, true);
 	obs_source_set_async_decoupled(source, true);
-	for (int index = 0; index < 2; ++index)
-		playerCallbacks[index] = {this, index};
 }
 
 ReplayChannelSource::~ReplayChannelSource() { reset(); }
@@ -80,10 +147,12 @@ ReplayChannel ReplayChannelSource::channel() const { return replayChannel; }
 void ReplayChannelSource::reset()
 {
 	std::array<media_playback_t *, 2> decoders = {};
+	std::array<std::shared_ptr<PlayerCallback>, 2> callbacks;
 	{
 		std::lock_guard lock(mutex);
 		for (int index = 0; index < 2; ++index) {
 			decoders[index] = players[index].decoder;
+			callbacks[index] = std::move(players[index].callback);
 			players[index] = {};
 			cachedVideo[index] = {};
 			pendingAudio[index].clear();
@@ -95,16 +164,35 @@ void ReplayChannelSource::reset()
 		fadeStartNs = 0;
 		fadeDurationNs = 0;
 	}
-	for (media_playback_t *decoder : decoders) {
+	for (int index = 0; index < 2; ++index) {
+		auto &callback = callbacks[index];
+		if (callback) {
+			std::lock_guard callbackLock(callback->mutex);
+			callback->channel = nullptr;
+		}
+		media_playback_t *decoder = decoders[index];
 		if (decoder) {
 			media_playback_stop(decoder);
-			media_playback_release_speed_state(decoder);
-			media_playback_destroy(decoder);
+			decoder_cleanup_queue().enqueue(decoder, std::move(callback));
 		}
 	}
 	if (source)
 		obs_source_output_video(source, nullptr);
 }
+
+bool ReplayChannelSource::hasPendingStartOrCue()
+{
+	std::lock_guard lock(mutex);
+	for (const Slot &player : players) {
+		if (player.state == PlayerState::LoadingActive || player.state == PlayerState::LoadingCued ||
+		    player.state == PlayerState::SeekingActive || player.state == PlayerState::SeekingCued ||
+		    (player.state == PlayerState::Playing && !player.mediaStarted))
+			return true;
+	}
+	return false;
+}
+
+void ReplayChannelSource::shutdownDecoderCleanup() { decoder_cleanup_queue().shutdown(); }
 
 bool ReplayChannelSource::load(const QString &path, qint64 positionMilliseconds, QString *error)
 {
@@ -132,7 +220,9 @@ bool ReplayChannelSource::takeCued(int fadeDurationMilliseconds, QString *error)
 		const int outgoingPlayer = activePlayer;
 		if (fade) {
 			fadingOutPlayer = outgoingPlayer;
-			fadeStartNs = os_gettime_ns();
+			// Start on the first incoming video frame, not while its decoder is
+			// still waking up and the outgoing event is the only visible frame.
+			fadeStartNs = 0;
 			fadeDurationNs = static_cast<uint64_t>(fadeDurationMilliseconds) * 1000000ULL;
 			deferredPlaybackSpeedPercent = playbackSpeedPercent;
 			hasDeferredPlaybackSpeed = false;
@@ -147,6 +237,7 @@ bool ReplayChannelSource::takeCued(int fadeDurationMilliseconds, QString *error)
 		}
 		activePlayer = nextPlayer;
 		players[activePlayer].state = PlayerState::Playing;
+		players[activePlayer].mediaStarted = false;
 		decoder = players[activePlayer].decoder;
 	}
 	if (!fade)
@@ -155,7 +246,6 @@ bool ReplayChannelSource::takeCued(int fadeDurationMilliseconds, QString *error)
 	blog(LOG_INFO, "[obs-replays] Taking preloaded Channel %c player %d to air%s.",
 	     replayChannel == ReplayChannel::A ? 'A' : 'B', activePlayer + 1,
 	     fade ? " with an event fade" : "");
-	obs_source_media_started(source);
 	return true;
 }
 
@@ -203,7 +293,10 @@ bool ReplayChannelSource::loadSlot(int playerIndex, const QString &path, qint64 
 		players[playerIndex].state = state;
 	}
 	struct mp_media_info info = {};
-	info.opaque = &playerCallbacks[playerIndex];
+	auto callback = std::make_shared<PlayerCallback>();
+	callback->channel = this;
+	callback->playerIndex = playerIndex;
+	info.opaque = callback.get();
 	info.v_cb = videoFrame;
 	info.v_preload_cb = seekFrame;
 	info.v_seek_cb = seekFrame;
@@ -223,7 +316,11 @@ bool ReplayChannelSource::loadSlot(int playerIndex, const QString &path, qint64 
 		*error = "OBS could not open the replay event media.";
 		return false;
 	}
-	{ std::lock_guard lock(mutex); players[playerIndex].decoder = decoder; }
+	{
+		std::lock_guard lock(mutex);
+		players[playerIndex].decoder = decoder;
+		players[playerIndex].callback = std::move(callback);
+	}
 	blog(LOG_INFO, "[obs-replays] Opening Channel %c player %d at %lld ms: %s",
 	     replayChannel == ReplayChannel::A ? 'A' : 'B', playerIndex + 1,
 	     static_cast<long long>(positionMilliseconds), utf8Path.constData());
@@ -234,17 +331,22 @@ bool ReplayChannelSource::loadSlot(int playerIndex, const QString &path, qint64 
 void ReplayChannelSource::releaseSlot(int playerIndex)
 {
 	media_playback_t *decoder = nullptr;
+	std::shared_ptr<PlayerCallback> callback;
 	{
 		std::lock_guard lock(mutex);
 		decoder = players[playerIndex].decoder;
+		callback = std::move(players[playerIndex].callback);
 		players[playerIndex] = {};
 		cachedVideo[playerIndex] = {};
 		pendingAudio[playerIndex].clear();
 	}
+	if (callback) {
+		std::lock_guard callbackLock(callback->mutex);
+		callback->channel = nullptr;
+	}
 	if (decoder) {
 		media_playback_stop(decoder);
-		media_playback_release_speed_state(decoder);
-		media_playback_destroy(decoder);
+		decoder_cleanup_queue().enqueue(decoder, std::move(callback));
 	}
 }
 
@@ -392,14 +494,46 @@ bool ReplayChannelSource::blendAudioFrames(const CachedAudioFrame &outgoing,
 					   const CachedAudioFrame &incoming, float incomingGain,
 					   CachedAudioFrame &destination)
 {
-	if (!outgoing.audio.frames || outgoing.audio.frames != incoming.audio.frames ||
+	if (!outgoing.audio.frames || !incoming.audio.frames ||
 	    outgoing.audio.format != incoming.audio.format ||
 	    outgoing.audio.speakers != incoming.audio.speakers ||
 	    outgoing.audio.samples_per_sec != incoming.audio.samples_per_sec)
 		return false;
 
+	CachedAudioFrame resizedIncoming = {};
+	const CachedAudioFrame *incomingFrame = &incoming;
+	if (outgoing.audio.frames != incoming.audio.frames) {
+		if (incoming.audio.format != AUDIO_FORMAT_FLOAT &&
+		    incoming.audio.format != AUDIO_FORMAT_FLOAT_PLANAR &&
+		    incoming.audio.format != AUDIO_FORMAT_16BIT &&
+		    incoming.audio.format != AUDIO_FORMAT_16BIT_PLANAR)
+			return false;
+		resizedIncoming.audio = incoming.audio;
+		resizedIncoming.audio.frames = outgoing.audio.frames;
+		const bool planar = is_audio_planar(incoming.audio.format);
+		const size_t planes = get_audio_planes(incoming.audio.format, incoming.audio.speakers);
+		const size_t channels = get_audio_channels(incoming.audio.speakers);
+		for (size_t plane = 0; plane < planes; ++plane) {
+			resizedIncoming.data[plane].resize(get_audio_size(
+				incoming.audio.format, incoming.audio.speakers, outgoing.audio.frames));
+			if (incoming.audio.format == AUDIO_FORMAT_FLOAT ||
+			    incoming.audio.format == AUDIO_FORMAT_FLOAT_PLANAR)
+				resample_audio_plane<float>(incoming.audio.data[plane],
+					resizedIncoming.data[plane].data(), incoming.audio.frames,
+					outgoing.audio.frames, channels, planar);
+			else
+				resample_audio_plane<int16_t>(incoming.audio.data[plane],
+					resizedIncoming.data[plane].data(), incoming.audio.frames,
+					outgoing.audio.frames, channels, planar);
+			resizedIncoming.audio.data[plane] = resizedIncoming.data[plane].data();
+		}
+		incomingFrame = &resizedIncoming;
+	}
+
 	CachedAudioFrame blend = outgoing;
-	blend.audio.timestamp = std::max(outgoing.audio.timestamp, incoming.audio.timestamp);
+	// The outgoing lane is the transition clock. Its timestamp remains
+	// continuous even if the resumed incoming decoder starts a little later.
+	blend.audio.timestamp = outgoing.audio.timestamp;
 	const float outgoingGain = std::sqrt(std::max(0.0f, 1.0f - incomingGain * incomingGain));
 	const size_t planes = get_audio_planes(blend.audio.format, blend.audio.speakers);
 	const size_t samples = is_audio_planar(blend.audio.format)
@@ -408,13 +542,13 @@ bool ReplayChannelSource::blendAudioFrames(const CachedAudioFrame &outgoing,
 	for (size_t plane = 0; plane < planes; ++plane) {
 		if (blend.audio.format == AUDIO_FORMAT_FLOAT || blend.audio.format == AUDIO_FORMAT_FLOAT_PLANAR) {
 			auto *out = reinterpret_cast<float *>(blend.data[plane].data());
-			const auto *in = reinterpret_cast<const float *>(incoming.data[plane].data());
+			const auto *in = reinterpret_cast<const float *>(incomingFrame->data[plane].data());
 			for (size_t sample = 0; sample < samples; ++sample)
 				out[sample] = out[sample] * outgoingGain + in[sample] * incomingGain;
 		} else if (blend.audio.format == AUDIO_FORMAT_16BIT ||
 			   blend.audio.format == AUDIO_FORMAT_16BIT_PLANAR) {
 			auto *out = reinterpret_cast<int16_t *>(blend.data[plane].data());
-			const auto *in = reinterpret_cast<const int16_t *>(incoming.data[plane].data());
+			const auto *in = reinterpret_cast<const int16_t *>(incomingFrame->data[plane].data());
 			for (size_t sample = 0; sample < samples; ++sample) {
 				const float value = out[sample] * outgoingGain + in[sample] * incomingGain;
 				out[sample] = static_cast<int16_t>(std::clamp(value, -32768.0f, 32767.0f));
@@ -432,6 +566,8 @@ float ReplayChannelSource::transitionProgressLocked(uint64_t nowNs) const
 {
 	if (fadingOutPlayer < 0 || !fadeDurationNs)
 		return 1.0f;
+	if (!fadeStartNs)
+		return 0.0f;
 	return std::clamp(static_cast<float>(nowNs - fadeStartNs) / fadeDurationNs, 0.0f, 1.0f);
 }
 
@@ -444,22 +580,37 @@ void ReplayChannelSource::deactivate(void *data) { if (auto *channel = static_ca
 void ReplayChannelSource::videoFrame(void *data, obs_source_frame *frame)
 {
 	auto *callback = static_cast<PlayerCallback *>(data);
-	if (callback && callback->channel) callback->channel->receiveVideo(callback->playerIndex, frame, false);
+	if (!callback)
+		return;
+	std::lock_guard lock(callback->mutex);
+	if (callback->channel)
+		callback->channel->receiveVideo(callback->playerIndex, frame, false);
 }
 void ReplayChannelSource::seekFrame(void *data, obs_source_frame *frame)
 {
 	auto *callback = static_cast<PlayerCallback *>(data);
-	if (callback && callback->channel) callback->channel->receiveVideo(callback->playerIndex, frame, true);
+	if (!callback)
+		return;
+	std::lock_guard lock(callback->mutex);
+	if (callback->channel)
+		callback->channel->receiveVideo(callback->playerIndex, frame, true);
 }
 void ReplayChannelSource::audioFrame(void *data, obs_source_audio *audio)
 {
 	auto *callback = static_cast<PlayerCallback *>(data);
-	if (callback && callback->channel) callback->channel->receiveAudio(callback->playerIndex, audio);
+	if (!callback)
+		return;
+	std::lock_guard lock(callback->mutex);
+	if (callback->channel)
+		callback->channel->receiveAudio(callback->playerIndex, audio);
 }
 void ReplayChannelSource::playbackStopped(void *data)
 {
 	auto *callback = static_cast<PlayerCallback *>(data);
-	if (callback && callback->channel)
+	if (!callback)
+		return;
+	std::lock_guard lock(callback->mutex);
+	if (callback->channel)
 		blog(LOG_WARNING, "[obs-replays] Channel %c player %d stopped before completing playout.",
 		     callback->channel->channel() == ReplayChannel::A ? 'A' : 'B',
 		     callback->playerIndex + 1);
@@ -478,31 +629,42 @@ void ReplayChannelSource::outputTransitionVideo(int playerIndex, obs_source_fram
 		if (fadingOutPlayer < 0)
 			return;
 		cacheVideoFrame(cachedVideo[playerIndex], frame);
-		const float progress = transitionProgressLocked(os_gettime_ns());
-		if (cachedVideo[fadingOutPlayer].valid && cachedVideo[activePlayer].valid &&
-		    blendVideoFrames(cachedVideo[fadingOutPlayer], cachedVideo[activePlayer], progress, blended)) {
-			blended.frame.timestamp = frame->timestamp;
-			outputBlended = true;
-		}
-		if (!outputBlended && playerIndex == fadingOutPlayer)
-			outputCurrent = true;
-		if (progress >= 1.0f) {
-			decoderToPause = players[fadingOutPlayer].decoder;
-			players[fadingOutPlayer].state = PlayerState::Idle;
-			pendingAudio[fadingOutPlayer].clear();
-			fadingOutPlayer = -1;
-			fadeStartNs = 0;
-			fadeDurationNs = 0;
-			if (hasDeferredPlaybackSpeed) {
-				deferredSpeed = deferredPlaybackSpeedPercent;
-				hasDeferredPlaybackSpeed = false;
-				if (playbackSpeedPercent != deferredSpeed) {
-					playbackSpeedPercent = deferredSpeed;
-					pendingAudio[activePlayer].clear();
-					decoderToRetune = players[activePlayer].decoder;
-				}
+		if (playerIndex != activePlayer) {
+			// Keep the outgoing event advancing until the incoming decoder has a
+			// real frame. After that, outgoing callbacks only refresh the cached
+			// side so two independent clocks never both submit transition frames.
+			outputCurrent = fadeStartNs == 0;
+		} else {
+			if (!fadeStartNs)
+				fadeStartNs = os_gettime_ns();
+			const float progress = transitionProgressLocked(os_gettime_ns());
+			if (cachedVideo[fadingOutPlayer].valid && cachedVideo[activePlayer].valid &&
+			    blendVideoFrames(cachedVideo[fadingOutPlayer], cachedVideo[activePlayer], progress,
+					     blended)) {
+				blended.frame.timestamp = frame->timestamp;
+				outputBlended = true;
 			}
-			outputCurrent = playerIndex == activePlayer;
+			if (!outputBlended && progress >= 1.0f)
+				outputCurrent = true;
+			if (progress >= 1.0f) {
+				decoderToPause = players[fadingOutPlayer].decoder;
+				players[fadingOutPlayer].state = PlayerState::Idle;
+				pendingAudio[0].clear();
+				pendingAudio[1].clear();
+				fadingOutPlayer = -1;
+				fadeStartNs = 0;
+				fadeDurationNs = 0;
+				if (hasDeferredPlaybackSpeed) {
+					deferredSpeed = deferredPlaybackSpeedPercent;
+					hasDeferredPlaybackSpeed = false;
+					if (playbackSpeedPercent != deferredSpeed) {
+						playbackSpeedPercent = deferredSpeed;
+						pendingAudio[activePlayer].clear();
+						decoderToRetune = players[activePlayer].decoder;
+					}
+				}
+				outputCurrent = true;
+			}
 		}
 	}
 	if (decoderToPause)
@@ -510,10 +672,8 @@ void ReplayChannelSource::outputTransitionVideo(int playerIndex, obs_source_fram
 	if (decoderToRetune)
 		media_playback_set_speed(decoderToRetune, deferredSpeed);
 	if (outputBlended) {
-		obs_source_set_video_frame(source, &blended.frame);
 		obs_source_output_video(source, &blended.frame);
 	} else if (outputCurrent) {
-		obs_source_set_video_frame(source, frame);
 		obs_source_output_video(source, frame);
 	}
 }
@@ -524,30 +684,60 @@ void ReplayChannelSource::outputTransitionAudio(int playerIndex, CachedAudioFram
 	bool outputMixed = false;
 	{
 		std::lock_guard lock(mutex);
-		if (fadingOutPlayer < 0)
+		if (fadingOutPlayer < 0) {
+			// The video callback may have completed the fade after receiveAudio()
+			// observed it. Preserve an active incoming block across that race.
+			if (playerIndex == activePlayer &&
+			    players[playerIndex].state == PlayerState::Playing) {
+				mixed = std::move(audio);
+				outputMixed = true;
+			}
+		} else if (!audio.audio.frames) {
 			return;
-		if (!audio.audio.frames)
-			return;
-		auto &queue = pendingAudio[playerIndex];
-		queue.emplace_back(std::move(audio));
-		if (queue.size() > 4)
-			queue.pop_front();
-		auto &outgoing = pendingAudio[fadingOutPlayer];
-		auto &incoming = pendingAudio[activePlayer];
-		if (outgoing.empty() || incoming.empty())
-			return;
-		const float linearProgress = transitionProgressLocked(os_gettime_ns());
-		constexpr float halfPi = 1.57079632679f;
-		const float incomingGain = std::sin(linearProgress * halfPi);
-		if (blendAudioFrames(outgoing.front(), incoming.front(), incomingGain, mixed)) {
-			outgoing.pop_front();
-			incoming.pop_front();
-			outputMixed = true;
 		} else {
-			mixed = std::move(incoming.front());
-			incoming.pop_front();
-			outgoing.pop_front();
-			outputMixed = true;
+			// Incoming callbacks only feed a short matching queue. The outgoing
+			// lane remains the sole output clock, so decoder startup cannot create
+			// a hole in the submitted audio stream.
+			if (playerIndex == activePlayer) {
+				auto &incoming = pendingAudio[activePlayer];
+				incoming.emplace_back(std::move(audio));
+				if (incoming.size() > 4)
+					incoming.pop_front();
+				return;
+			}
+			if (playerIndex != fadingOutPlayer)
+				return;
+
+			if (!fadeStartNs) {
+				mixed = std::move(audio);
+				outputMixed = true;
+			} else {
+				auto &incoming = pendingAudio[activePlayer];
+				while (incoming.size() > 1) {
+					auto distance = [&audio](uint64_t timestamp) {
+						return timestamp > audio.audio.timestamp
+							? timestamp - audio.audio.timestamp
+							: audio.audio.timestamp - timestamp;
+					};
+					if (distance(incoming[1].audio.timestamp) >
+					    distance(incoming[0].audio.timestamp))
+						break;
+					incoming.pop_front();
+				}
+				const float linearProgress = transitionProgressLocked(os_gettime_ns());
+				constexpr float halfPi = 1.57079632679f;
+				const float incomingGain = std::sin(linearProgress * halfPi);
+				if (!incoming.empty() &&
+				    blendAudioFrames(audio, incoming.front(), incomingGain, mixed)) {
+					incoming.pop_front();
+					outputMixed = true;
+				} else {
+					// A late/mismatched incoming block degrades to uninterrupted
+					// outgoing audio, never silence or a hard incoming switch.
+					mixed = std::move(audio);
+					outputMixed = true;
+				}
+			}
 		}
 	}
 	if (outputMixed)
@@ -579,10 +769,14 @@ void ReplayChannelSource::receiveVideo(int playerIndex, obs_source_frame *frame,
 		} else if (isSeekFrame && players[playerIndex].state == PlayerState::SeekingActive) {
 			players[playerIndex].state = PlayerState::Playing;
 			decoderToResume = players[playerIndex].decoder;
-			outputActive = signalStarted = true;
+			outputActive = true;
 			setSeekFrame = true;
 		} else if (playerIndex == activePlayer && players[playerIndex].state == PlayerState::Playing) {
 			outputActive = true;
+			if (!isSeekFrame && !players[playerIndex].mediaStarted) {
+				players[playerIndex].mediaStarted = true;
+				signalStarted = true;
+			}
 		}
 	}
 	if (decoderToSeek) {
@@ -624,14 +818,11 @@ void ReplayChannelSource::receiveVideo(int playerIndex, obs_source_frame *frame,
 	}
 	if (transitionOutput) {
 		outputTransitionVideo(playerIndex, frame);
+		if (signalStarted)
+			obs_source_media_started(source);
 		return;
 	}
 	if (outputActive && !setSeekFrame) {
-		// Keep OBS's retained async texture current as well as submitting the
-		// timed frame. If the underlying segment reaches EOF while an outro
-		// stinger is still rendering, that retained texture holds the final
-		// replay frame instead of timing out to black.
-		obs_source_set_video_frame(source, frame);
 		obs_source_output_video(source, frame);
 	}
 	if (signalStarted) obs_source_media_started(source);

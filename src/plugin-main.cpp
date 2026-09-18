@@ -269,6 +269,7 @@ int replay_playout_index = -1;
 qint64 pending_seek_milliseconds = -1;
 bool awaiting_event_start = false;
 uint64_t playback_generation = 0;
+uint64_t cue_generation = 0;
 qint64 intro_transition_point_milliseconds = 0;
 qint64 first_event_intro_lead_milliseconds = 0;
 bool outro_cleanup_pending = false;
@@ -500,7 +501,9 @@ void update_playback_speed(int percent)
 
 void cancel_playback_rate_animation()
 {
-	if (playback_rate_animation_timer)
+	// The dock owns this timer and OBS can destroy the dock before calling
+	// obs_module_unload(). Never dereference the cached pointer in that phase.
+	if (!module_unloading && playback_rate_animation_timer)
 		playback_rate_animation_timer->stop();
 	playback_rate_animation_start_ns = 0;
 	playback_rate_animation_duration_ns = 0;
@@ -546,8 +549,16 @@ void update_event_playout_timer()
 		advance_replay_playout();
 		return;
 	}
+	if (outro_cleanup_pending) {
+		event_playout_timer->stop();
+		return;
+	}
+	if (awaiting_event_start)
+		return;
 	if (event_playout_remaining_media_milliseconds <= 0.0) {
-		if (event_playout_timer)
+		const bool has_next_event = replay_playout_index >= 0 &&
+			replay_playout_index + 1 < replay_playout_queue.size();
+		if (!has_next_event)
 			event_playout_timer->stop();
 		advance_replay_playout();
 		return;
@@ -567,7 +578,12 @@ void update_event_playout_timer()
 		? between_events_fade_duration_milliseconds() * playback_speed_percent() / 100.0
 		: 0.0;
 	if (event_playout_remaining_media_milliseconds <= transition_lead_media_milliseconds) {
-		event_playout_timer->stop();
+		// Keep ticking until the asynchronous cue is ready. A failed take rolls
+		// the index back, so a later tick retries while outgoing media continues.
+		// The final event has nothing to retry and must stop ticking before it
+		// starts the asynchronous outro transition.
+		if (!has_next_event)
+			event_playout_timer->stop();
 		advance_replay_playout();
 	}
 }
@@ -939,6 +955,7 @@ void flush_scheduled_settings_save()
 void clear_playout_state()
 {
 	++playback_generation;
+	++cue_generation;
 	cancel_playback_rate_animation();
 	if (!module_unloading && event_playout_timer)
 		event_playout_timer->stop();
@@ -1394,6 +1411,8 @@ bool take_replay_to_program(QString *error)
 
 bool return_to_previous_program(QString *error)
 {
+	if (outro_cleanup_pending)
+		return true;
 	if (!active_replay_scene || !previous_program_scene) {
 		*error = "There is no replay playout to return from.";
 		return false;
@@ -1422,6 +1441,36 @@ bool return_to_previous_program(QString *error)
 	restore_default_transition();
 	playout_status->setText("Outro transition in progress…");
 	return true;
+}
+
+void arm_decoder_cue_timeout()
+{
+	constexpr int cue_timeout_milliseconds = 5000;
+	const uint64_t cue_token = ++cue_generation;
+	const uint64_t playout_token = playback_generation;
+	if (!replay_dock)
+		return;
+	QTimer::singleShot(cue_timeout_milliseconds, replay_dock, [cue_token, playout_token]() {
+		if (module_unloading || cue_token != cue_generation ||
+		    playout_token != playback_generation || !active_replay_playback_source)
+			return;
+		auto *channel = obs_replays::ReplayChannelSource::fromSource(active_replay_playback_source);
+		if (!channel || !channel->hasPendingStartOrCue())
+			return;
+
+		obs_log(LOG_ERROR, "OBS Replays: replay decoder did not finish cueing within %d ms; ending playout.",
+			cue_timeout_milliseconds);
+		QString error;
+		if (return_to_previous_program(&error)) {
+			if (playout_status)
+				playout_status->setText("Replay decoder timed out; returning to the previous Program scene.");
+		} else {
+			clear_playout_state();
+			if (playout_status)
+				playout_status->setText(error.isEmpty() ? "Replay decoder timed out; playout was stopped."
+								       : error);
+		}
+	});
 }
 
 void finish_outro_transition(void *data)
@@ -1478,6 +1527,8 @@ void start_active_replay_event(void *data)
 			    !replay_channel->cueNext(next.segmentPath, next.inMilliseconds, &error))
 				playout_status->setText(error.isEmpty() ? "The next replay event could not be cued."
 								       : error);
+			else
+				arm_decoder_cue_timeout();
 		};
 		const qint64 fade_duration = between_events_fade_duration_milliseconds();
 		if (replay_playout_index > 0 && fade_duration > 0) {
@@ -1563,6 +1614,7 @@ bool play_next_replay_event(QString *error)
 		awaiting_event_start = false;
 		return false;
 	}
+	arm_decoder_cue_timeout();
 	return true;
 }
 
@@ -1585,6 +1637,9 @@ void advance_replay_playout()
 			playout_status->setText(error);
 			return;
 		}
+		// A successfully preloaded decoder can still fail to produce its first
+		// on-air frame after being resumed, so give that hand-off its own timeout.
+		arm_decoder_cue_timeout();
 		return;
 	}
 	QString error;
@@ -2474,6 +2529,7 @@ void obs_module_unload(void)
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
 	close_recording_session_for_shutdown();
 	clear_playout_state();
+	obs_replays::ReplayChannelSource::shutdownDecoderCleanup();
 	if (replay_dock)
 		obs_frontend_remove_dock(dock_id);
 	replay_dock = nullptr;

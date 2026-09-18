@@ -88,8 +88,14 @@ void SegmentWriter::stop()
 
 void SegmentWriter::forceStop()
 {
-	if (output)
+	if (output) {
 		obs_output_force_stop(output);
+		// ffmpeg_muxer normally finishes a forced stop on its next packet. If
+		// interleaving never began there is no next packet, so explicitly detach
+		// the encoders; output destruction will terminate the helper process.
+		if (obs_output_active(output))
+			obs_output_end_data_capture(output);
+	}
 }
 
 void SegmentWriter::release()

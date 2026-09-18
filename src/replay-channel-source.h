@@ -7,6 +7,7 @@
 
 #include <array>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -24,6 +25,8 @@ public:
 
 	ReplayChannel channel() const;
 	void reset();
+	bool hasPendingStartOrCue();
+	static void shutdownDecoderCleanup();
 	bool load(const QString &path, qint64 positionMilliseconds, QString *error);
 	bool cueNext(const QString &path, qint64 positionMilliseconds, QString *error);
 	bool takeCued(int fadeDurationMilliseconds, QString *error);
@@ -40,13 +43,17 @@ private:
 		Cued,
 		Playing,
 	};
+	struct PlayerCallback;
 	struct Slot {
 		media_playback_t *decoder = nullptr;
+		std::shared_ptr<PlayerCallback> callback;
 		QByteArray path;
 		qint64 positionMilliseconds = 0;
 		PlayerState state = PlayerState::Idle;
+		bool mediaStarted = false;
 	};
 	struct PlayerCallback {
+		std::mutex mutex;
 		ReplayChannelSource *channel = nullptr;
 		int playerIndex = 0;
 	};
@@ -94,7 +101,6 @@ private:
 	// "slots" is a Qt keyword macro in OBS's Qt-enabled build, so use a
 	// non-Qt identifier here.
 	std::array<Slot, 2> players;
-	std::array<PlayerCallback, 2> playerCallbacks;
 	std::array<CachedVideoFrame, 2> cachedVideo;
 	std::array<std::deque<CachedAudioFrame>, 2> pendingAudio;
 	std::mutex mutex;

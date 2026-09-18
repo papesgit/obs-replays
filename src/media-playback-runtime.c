@@ -139,3 +139,21 @@ void media_playback_release_speed_state(media_playback_t *playback)
 	if (playback && !playback->is_cached)
 		obs_replays_release_media_speed_state(&playback->media);
 }
+
+void obs_replays_destroy_media_playback(media_playback_t *playback)
+{
+	if (!playback)
+		return;
+
+	if (playback->is_cached) {
+		media_playback_destroy(playback);
+		return;
+	}
+
+	/* Keep the runtime speed state alive until the decode thread has exited.
+	 * Releasing it before mp_media_free() joins the thread lets an in-flight
+	 * decode recreate the state for an object that is about to be freed. */
+	mp_media_free(&playback->media);
+	obs_replays_release_media_speed_state(&playback->media);
+	bfree(playback);
+}
