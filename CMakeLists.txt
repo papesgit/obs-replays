@@ -16,27 +16,37 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
-# Compile OBS's media-playback implementation into this plugin.  The OBS
-# plugintemplate dependency bundle already carries the matching FFmpeg headers
-# and import libraries, but it deliberately does not install FFmpegConfig.cmake.
-# Referencing those bundled files directly keeps this build self-contained.
+# Compile OBS's media-playback implementation into this plugin. The OBS
+# plugintemplate dependency bundle carries the FFmpeg headers and import
+# libraries, but deliberately does not install FFmpegConfig.cmake. Resolve the
+# active dependency prefix rather than pinning a dated bundle name so the FFmpeg
+# ABI selected in buildspec.json is also the ABI imported by this module.
+# Windows extracts the upstream tag ZIP to obs-studio-<version>; macOS uses the
+# release source tarball, whose top-level directory is obs-studio-<version>-sources.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/buildspec.json" OBS_REPLAYS_BUILDSPEC)
+string(JSON OBS_REPLAYS_OBS_VERSION GET "${OBS_REPLAYS_BUILDSPEC}" dependencies obs-studio version)
+set(OBS_REPLAYS_OBS_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-studio-${OBS_REPLAYS_OBS_VERSION}")
+if(OS_MACOS)
+  string(APPEND OBS_REPLAYS_OBS_SOURCE_DIR "-sources")
+endif()
 set(OBS_REPLAYS_MEDIA_PLAYBACK_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-studio-31.1.1/shared/media-playback")
-set(OBS_REPLAYS_DEPS_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-deps-2025-07-11-x64")
-set(OBS_REPLAYS_FFMPEG_RUNTIME_DLLS
-    "${OBS_REPLAYS_DEPS_DIR}/bin/avcodec-61.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/avdevice-61.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/avfilter-10.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/avformat-61.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/avutil-59.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/librist.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/libx264-164.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/srt.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/swresample-5.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/swscale-8.dll"
-    "${OBS_REPLAYS_DEPS_DIR}/bin/zlib.dll"
-)
+    "${OBS_REPLAYS_OBS_SOURCE_DIR}/shared/media-playback")
+find_path(OBS_REPLAYS_DEPS_DIR
+          NAMES include/libavcodec/avcodec.h
+          PATHS ${CMAKE_PREFIX_PATH}
+          NO_DEFAULT_PATH
+          REQUIRED)
+find_library(OBS_REPLAYS_AVCODEC_LIBRARY NAMES avcodec
+             PATHS "${OBS_REPLAYS_DEPS_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+find_library(OBS_REPLAYS_AVDEVICE_LIBRARY NAMES avdevice
+             PATHS "${OBS_REPLAYS_DEPS_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+find_library(OBS_REPLAYS_AVFORMAT_LIBRARY NAMES avformat
+             PATHS "${OBS_REPLAYS_DEPS_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+find_library(OBS_REPLAYS_AVUTIL_LIBRARY NAMES avutil
+             PATHS "${OBS_REPLAYS_DEPS_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+find_library(OBS_REPLAYS_SWSCALE_LIBRARY NAMES swscale
+             PATHS "${OBS_REPLAYS_DEPS_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 
 # The shared playback helper supports speed only at creation time. Generate a
 # locally patched decode unit which delegates timestamp scaling to our runtime
@@ -182,11 +192,11 @@ target_include_directories(
 )
 target_link_libraries(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE "${OBS_REPLAYS_DEPS_DIR}/lib/avcodec.lib"
-          "${OBS_REPLAYS_DEPS_DIR}/lib/avdevice.lib"
-          "${OBS_REPLAYS_DEPS_DIR}/lib/avformat.lib"
-          "${OBS_REPLAYS_DEPS_DIR}/lib/avutil.lib"
-          "${OBS_REPLAYS_DEPS_DIR}/lib/swscale.lib"
+  PRIVATE ${OBS_REPLAYS_AVCODEC_LIBRARY}
+          ${OBS_REPLAYS_AVDEVICE_LIBRARY}
+          ${OBS_REPLAYS_AVFORMAT_LIBRARY}
+          ${OBS_REPLAYS_AVUTIL_LIBRARY}
+          ${OBS_REPLAYS_SWSCALE_LIBRARY}
 )
 
 if(ENABLE_FRONTEND_API)
@@ -217,20 +227,3 @@ target_sources(
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
-
-# The direct replay decoder links against the FFmpeg runtime shipped by the OBS
-# dependency bundle. OBS loads runtime DLLs from bin/64bit; putting them in
-# obs-plugins/64bit makes its plugin scanner try (and correctly fail) to treat
-# them as modules. The install layout keeps them under bin/64bit accordingly.
-install(FILES ${OBS_REPLAYS_FFMPEG_RUNTIME_DLLS}
-        DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")
-add_custom_command(
-  TARGET ${CMAKE_PROJECT_NAME}
-  POST_BUILD
-  COMMAND "${CMAKE_COMMAND}" -E make_directory
-          "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/bin/64bit"
-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${OBS_REPLAYS_FFMPEG_RUNTIME_DLLS}
-          "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/bin/64bit"
-  COMMENT "Copy FFmpeg replay runtime dependencies"
-  VERBATIM
-)
