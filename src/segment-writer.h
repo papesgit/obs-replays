@@ -21,8 +21,8 @@ class SegmentWriter {
 public:
 	~SegmentWriter();
 
-	bool start(video_t *video, audio_t *audio, const QString &path, int videoBitrateMbps,
-		   int audioBitrateKbps, QString *error);
+	bool start(video_t *video, audio_t *audio, const QString &path, int videoBitrateMbps, int audioBitrateKbps,
+		   QString *error);
 	void stop();
 	void forceStop();
 	void release();

@@ -11,8 +11,8 @@ SegmentWriter::~SegmentWriter()
 	release();
 }
 
-bool SegmentWriter::start(video_t *video, audio_t *audio, const QString &path,
-			  int videoBitrateMbps, int audioBitrateKbps, QString *error)
+bool SegmentWriter::start(video_t *video, audio_t *audio, const QString &path, int videoBitrateMbps,
+			  int audioBitrateKbps, QString *error)
 {
 	if (output || !video || !audio || path.isEmpty()) {
 		*error = "Cannot start the replay recording writer.";
@@ -36,8 +36,7 @@ bool SegmentWriter::start(video_t *video, audio_t *audio, const QString &path,
 
 	obs_data_t *audioSettings = obs_data_create();
 	obs_data_set_int(audioSettings, "bitrate", audioBitrateKbps);
-	audioEncoder = obs_audio_encoder_create("ffmpeg_aac", "obs-replays-audio", audioSettings, 0,
-						nullptr);
+	audioEncoder = obs_audio_encoder_create("ffmpeg_aac", "obs-replays-audio", audioSettings, 0, nullptr);
 	obs_data_release(audioSettings);
 	if (!audioEncoder) {
 		release();
@@ -73,7 +72,7 @@ bool SegmentWriter::start(video_t *video, audio_t *audio, const QString &path,
 	if (!obs_output_start(output)) {
 		const char *lastError = obs_output_get_last_error(output);
 		*error = lastError && *lastError ? QString::fromUtf8(lastError)
-							 : QStringLiteral("OBS could not start the replay MP4 output.");
+						 : QStringLiteral("OBS could not start the replay MP4 output.");
 		release();
 		return false;
 	}

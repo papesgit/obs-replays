@@ -41,7 +41,7 @@ static inline bool obs_replays_websocket_ensure_proc_handler(void)
 }
 
 static inline bool obs_replays_websocket_run_vendor_proc(obs_websocket_vendor vendor, const char *procedure,
-							calldata_t *calldata)
+							 calldata_t *calldata)
 {
 	if (!obs_replays_websocket_ensure_proc_handler() || !vendor || !procedure || !*procedure || !calldata)
 		return false;
@@ -63,7 +63,8 @@ static inline obs_websocket_vendor obs_replays_websocket_register_vendor(const c
 }
 
 static inline bool obs_replays_websocket_register_request(obs_websocket_vendor vendor, const char *type,
-							  obs_websocket_request_callback_function callback, void *priv_data)
+							  obs_websocket_request_callback_function callback,
+							  void *priv_data)
 {
 	struct obs_replays_websocket_request_callback request_callback = {callback, priv_data};
 	calldata_t calldata = {0};
@@ -75,7 +76,7 @@ static inline bool obs_replays_websocket_register_request(obs_websocket_vendor v
 }
 
 static inline bool obs_replays_websocket_emit_event(obs_websocket_vendor vendor, const char *type,
-							 obs_data_t *event_data)
+						    obs_data_t *event_data)
 {
 	calldata_t calldata = {0};
 	calldata_set_string(&calldata, "type", type);

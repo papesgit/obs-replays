@@ -80,18 +80,18 @@ private:
 	static void audioFrame(void *data, obs_source_audio *audio);
 	static void playbackStopped(void *data);
 
-	bool loadSlot(int playerIndex, const QString &path, qint64 positionMilliseconds,
-		      PlayerState state, QString *error);
+	bool loadSlot(int playerIndex, const QString &path, qint64 positionMilliseconds, PlayerState state,
+		      QString *error);
 	void receiveVideo(int playerIndex, obs_source_frame *frame, bool seekFrame);
 	void receiveAudio(int playerIndex, obs_source_audio *audio);
 	void releaseSlot(int playerIndex);
 	static bool cacheVideoFrame(CachedVideoFrame &destination, const obs_source_frame *source);
 	static bool blendVideoFrames(const CachedVideoFrame &outgoing, const CachedVideoFrame &incoming,
-				    float incomingOpacity, CachedVideoFrame &destination);
+				     float incomingOpacity, CachedVideoFrame &destination);
 	static CachedAudioFrame cacheAudioFrame(const obs_source_audio *source);
 	static CachedAudioFrame resampleAudioFrame(const obs_source_audio *source, int speedPercent);
 	static bool blendAudioFrames(const CachedAudioFrame &outgoing, const CachedAudioFrame &incoming,
-				    float incomingGain, CachedAudioFrame &destination);
+				     float incomingGain, CachedAudioFrame &destination);
 	float transitionProgressLocked(uint64_t nowNs) const;
 	void outputTransitionVideo(int playerIndex, obs_source_frame *frame);
 	void outputTransitionAudio(int playerIndex, CachedAudioFrame audio);

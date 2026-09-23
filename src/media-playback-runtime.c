@@ -45,8 +45,7 @@ static struct speed_state *get_speed_state_locked(struct mp_media *media)
 	return state;
 }
 
-void obs_replays_scale_decode_timestamp(struct mp_decode *decoder, int64_t *timestamp,
-					int64_t *duration)
+void obs_replays_scale_decode_timestamp(struct mp_decode *decoder, int64_t *timestamp, int64_t *duration)
 {
 	if (!decoder || !timestamp || !duration)
 		return;
@@ -56,8 +55,8 @@ void obs_replays_scale_decode_timestamp(struct mp_decode *decoder, int64_t *time
 	const int64_t source_timestamp = *timestamp;
 	const int64_t source_duration = *duration;
 	const int speed = state->speed > 0 ? state->speed : 100;
-	const int64_t output_timestamp = state->output_anchor +
-		((source_timestamp - state->source_anchor) * 100) / speed;
+	const int64_t output_timestamp =
+		state->output_anchor + ((source_timestamp - state->source_anchor) * 100) / speed;
 	const int64_t output_duration = (source_duration * 100) / speed;
 	// Both decoder tracks use this one affine clock.  They naturally have
 	// different frame cadences, so separate per-track anchors would make a
@@ -90,8 +89,8 @@ void obs_replays_set_media_speed(struct mp_media *media, int speed)
 			continue;
 		if (state->has_frame) {
 			const int old_speed = state->speed > 0 ? state->speed : 100;
-			const int64_t pivot_output = state->output_anchor +
-				((state->last_source - state->source_anchor) * 100) / old_speed;
+			const int64_t pivot_output =
+				state->output_anchor + ((state->last_source - state->source_anchor) * 100) / old_speed;
 			state->source_anchor = state->last_source;
 			state->output_anchor = pivot_output;
 		}

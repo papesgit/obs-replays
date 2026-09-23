@@ -48,6 +48,17 @@ function Package {
     $ProductVersion = $BuildSpec.version
 
     $OutputName = "${ProductName}-${ProductVersion}-windows-${Target}"
+    $SymbolsOutputName = "${OutputName}-symbols"
+    $PluginBinary = "${ProjectRoot}/build_${Target}/${Configuration}/${ProductName}.dll"
+    $PluginSymbols = "${ProjectRoot}/build_${Target}/${Configuration}/${ProductName}.pdb"
+
+    if ( ! ( Test-Path -Path $PluginBinary -PathType Leaf ) ) {
+        throw "Plugin binary not found: ${PluginBinary}"
+    }
+
+    if ( ! ( Test-Path -Path $PluginSymbols -PathType Leaf ) ) {
+        throw "Plugin debug symbols not found: ${PluginSymbols}"
+    }
 
     $RemoveArgs = @{
         ErrorAction = 'SilentlyContinue'
@@ -60,9 +71,18 @@ function Package {
 
     Log-Group "Archiving ${ProductName}..."
     $CompressArgs = @{
-        Path = (Get-ChildItem -Path "${ProjectRoot}/release/${Configuration}" -Exclude "${OutputName}*.*")
+        Path = $PluginBinary
         CompressionLevel = 'Optimal'
         DestinationPath = "${ProjectRoot}/release/${OutputName}.zip"
+        Verbose = ($Env:CI -ne $null)
+    }
+    Compress-Archive -Force @CompressArgs
+
+    Log-Group "Archiving ${ProductName} debug symbols..."
+    $CompressArgs = @{
+        Path = $PluginSymbols
+        CompressionLevel = 'Optimal'
+        DestinationPath = "${ProjectRoot}/release/${SymbolsOutputName}.zip"
         Verbose = ($Env:CI -ne $null)
     }
     Compress-Archive -Force @CompressArgs

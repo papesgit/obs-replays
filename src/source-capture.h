@@ -44,10 +44,9 @@ private:
 	};
 
 	static void onVideoFrame(void *param, struct video_data *frame);
-	static void onAudioFrame(void *param, obs_source_t *source,
-			 const struct audio_data *audioData, bool muted);
-	static bool provideAudio(void *param, uint64_t startTs, uint64_t endTs, uint64_t *newTs,
-			 uint32_t activeMixers, struct audio_output_data *mixes);
+	static void onAudioFrame(void *param, obs_source_t *source, const struct audio_data *audioData, bool muted);
+	static bool provideAudio(void *param, uint64_t startTs, uint64_t endTs, uint64_t *newTs, uint32_t activeMixers,
+				 struct audio_output_data *mixes);
 
 	obs_source_t *source = nullptr;
 	obs_view_t *view = nullptr;

@@ -129,7 +129,7 @@ bool ReplaySession::addEvent(TimelineUs inUs, TimelineUs outUs, const QString &l
 }
 
 bool ReplaySession::updateEvent(qsizetype index, TimelineUs inUs, TimelineUs outUs, const QString &label,
-			QString *error)
+				QString *error)
 {
 	if (index < 0 || index >= replayEvents.size() || inUs < 0 || outUs <= inUs) {
 		*error = "The replay event range is invalid.";
@@ -164,16 +164,31 @@ bool ReplaySession::removeEvent(qsizetype index, QString *error)
 	return false;
 }
 
-bool ReplaySession::isActive() const { return active; }
-TimelineUs ReplaySession::latestTimelineUs() const { return liveTimelineUs; }
-QString ReplaySession::sessionId() const { return id; }
+bool ReplaySession::isActive() const
+{
+	return active;
+}
+TimelineUs ReplaySession::latestTimelineUs() const
+{
+	return liveTimelineUs;
+}
+QString ReplaySession::sessionId() const
+{
+	return id;
+}
 QUuid ReplaySession::activeTakeId() const
 {
 	const ReplayTake *take = activeTake();
 	return take ? take->id : QUuid();
 }
-const SessionConfiguration &ReplaySession::sessionConfiguration() const { return configuration; }
-const QString &ReplaySession::sessionDirectory() const { return directory; }
+const SessionConfiguration &ReplaySession::sessionConfiguration() const
+{
+	return configuration;
+}
+const QString &ReplaySession::sessionDirectory() const
+{
+	return directory;
+}
 
 QString ReplaySession::recordingPath() const
 {
@@ -187,14 +202,20 @@ QString ReplaySession::recordingPath(const QUuid &takeId) const
 	return take ? QDir(directory).filePath(take->recordingRelativePath) : QString();
 }
 
-const QList<ReplayEvent> &ReplaySession::events() const { return replayEvents; }
-const QList<ReplayTake> &ReplaySession::takes() const { return replayTakes; }
+const QList<ReplayEvent> &ReplaySession::events() const
+{
+	return replayEvents;
+}
+const QList<ReplayTake> &ReplaySession::takes() const
+{
+	return replayTakes;
+}
 
 bool ReplaySession::openMostRecentSession(const SessionConfiguration &sessionConfiguration, QString *error)
 {
 	const QDir replayFolder(sessionConfiguration.replayFolder);
-	const QFileInfoList candidates = replayFolder.entryInfoList(QStringList{"OBS-Replay-*"}, QDir::Dirs | QDir::NoDotAndDotDot,
-								   QDir::Time);
+	const QFileInfoList candidates =
+		replayFolder.entryInfoList(QStringList{"OBS-Replay-*"}, QDir::Dirs | QDir::NoDotAndDotDot, QDir::Time);
 	for (const QFileInfo &candidate : candidates) {
 		if (!loadManifest(QDir(candidate.absoluteFilePath()).filePath("session.json"), error))
 			continue;
@@ -212,8 +233,8 @@ bool ReplaySession::createSession(const SessionConfiguration &sessionConfigurati
 	replayEvents.clear();
 	replayTakes.clear();
 	liveTimelineUs = 0;
-	const QString sessionName = QString("OBS-Replay-%1-%2")
-					    .arg(startedAtUtc.toString("yyyy-MM-dd_hh-mm-ss"), id.left(8));
+	const QString sessionName =
+		QString("OBS-Replay-%1-%2").arg(startedAtUtc.toString("yyyy-MM-dd_hh-mm-ss"), id.left(8));
 	directory = QDir(configuration.replayFolder).filePath(sessionName);
 	if (!QDir().mkpath(QDir(directory).filePath("takes"))) {
 		*error = "Could not create the replay session folder.";
@@ -312,13 +333,17 @@ bool ReplaySession::saveManifest(QString *error) const
 	for (const ReplayTake &take : replayTakes)
 		takeArray.append(toJson(take));
 	QJsonObject root{{"schemaVersion", 2},
-			 {"id", id}, {"status", active ? "recording" : "stopped"},
+			 {"id", id},
+			 {"status", active ? "recording" : "stopped"},
 			 {"startedAtUtc", startedAtUtc.toString(Qt::ISODateWithMs)},
 			 {"stoppedAtUtc", stoppedAtUtc.toString(Qt::ISODateWithMs)},
-			 {"source", QJsonObject{{"name", configuration.sourceName}, {"uuid", configuration.sourceUuid}}},
-			 {"encoding", QJsonObject{{"container", "mp4"}, {"videoBitrateMbps", configuration.videoBitrateMbps},
-						    {"audioBitrateKbps", configuration.audioBitrateKbps}}},
-			 {"takes", takeArray}, {"events", eventArray}};
+			 {"source",
+			  QJsonObject{{"name", configuration.sourceName}, {"uuid", configuration.sourceUuid}}},
+			 {"encoding", QJsonObject{{"container", "mp4"},
+						  {"videoBitrateMbps", configuration.videoBitrateMbps},
+						  {"audioBitrateKbps", configuration.audioBitrateKbps}}},
+			 {"takes", takeArray},
+			 {"events", eventArray}};
 	QSaveFile file(QDir(directory).filePath("session.json"));
 	if (!file.open(QIODevice::WriteOnly)) {
 		*error = "Could not open the replay session manifest for writing.";

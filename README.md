@@ -2,7 +2,7 @@
 
 OBS Replays is an instant-replay plugin for OBS Studio. It continuously records a selected OBS source, lets an operator mark recent moments as replay events, and plays selected events through a dedicated replay scene.
 
-This project is currently a pre-release. Test it with your own sources and workflow before using it in a production broadcast.
+This project is currently in early development. Test it with your own sources and workflow before using it in a production broadcast.
 
 ## Features
 
@@ -22,7 +22,7 @@ This project is currently a pre-release. Test it with your own sources and workf
 - Windows x64
 - Sufficient storage for continuous replay recording
 
-The current pre-release is built and tested on Windows. Other platforms are not currently supported.
+The current release is built and tested on Windows. Other platforms are not currently supported.
 
 ## Installation
 
