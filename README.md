@@ -1,59 +1,83 @@
-# OBS Plugin Template
+# OBS Replays
 
-## Introduction
+OBS Replays is an instant-replay plugin for OBS Studio. It continuously records a selected OBS source, lets an operator mark recent moments as replay events, and plays selected events through a dedicated replay scene.
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+This project is currently a pre-release. Test it with your own sources and workflow before using it in a production broadcast.
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+## Features
 
-## Supported Build Environments
+- Continuous recording of one OBS source with configurable video and audio bitrates
+- Buttons for marking the previous 1, 2, 3, 5, or 10 seconds as an event
+- Editable event in/out times and labels
+- Playback of one or multiple selected events
+- Adjustable playback speed from 10% to 100%
+- Configurable intro, outro, and between-event transitions
+- Automatic return to the previous Program scene after playout
+- Persistent replay sessions containing recording takes and event metadata
+- An obs-websocket Vendor API for external control
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+## Requirements
 
-## Quick Start
+- OBS Studio 32.2.2
+- Windows x64
+- Sufficient storage for continuous replay recording
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+The current pre-release is built and tested on Windows. Other platforms are not currently supported.
 
-## Documentation
+## Installation
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+1. Close OBS Studio.
+2. Download the Windows archive from the GitHub Releases page.
+3. Extract the included `obs-replays.dll` to:
 
-Suggested reading to get up and running:
+   ```text
+   C:\ProgramData\obs-studio\plugins\obs-replays\bin\64bit\
+   ```
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+   You will have to create the folder structure in the plugins folder yourself.
+4. Start OBS Studio.
+5. Open the **Replays** dock from OBS's **Docks** menu if it is not already visible.
 
-## GitHub Actions & CI
+## Basic usage
 
-Default GitHub Actions workflows are available for the following repository actions:
+1. Create or choose a scene that will be used for replay playout.
+2. In the Replays dock, select the source to record and a folder for replay sessions.
+3. Configure the recording bitrates, replay scene, and transitions.
+4. Click **Start recording**.
+5. Use the `-1`, `-2`, `-3`, `-5`, or `-10` buttons to create an event ending at the current live position.
+6. Select one or more events in the table and click **Play selected events**.
+7. Click the same button during playout to stop and run the configured outro transition.
 
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
+The plugin creates an **OBS Replays Channel A** source in the selected replay scene when needed. Recording keeps the selected capture source active even when it is not part of the current Program scene.
 
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
+Replay recordings can use substantial disk space. The dock displays an estimate based on the selected bitrates and available storage.
 
-### Retrieving build artifacts
+## WebSocket API
 
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
+OBS Replays extends OBS's built-in obs-websocket server with recording, event, playout, and playback-rate controls. See [docs/Websocket.md](docs/Websocket.md) for the request and event reference.
 
-### Building a Release
+## Current limitations
 
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
+- One capture source and one replay playback channel
+- No multi-angle replay or synchronized camera switching
+- No event preview, pause, or manual seek controls
+- Source, network, decoder, or rendering stalls may be present in the recorded replay
+- Recording is stored as high-bitrate fragmented MP4 and is intended for replay use rather than archival recording
 
-## Signing and Notarizing on macOS
+## Building on Windows
 
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+Requirements:
+
+- Visual Studio 2022 with C++ development tools
+- CMake 3.28 or newer
+
+Configure and build:
+
+```powershell
+cmake --preset windows-x64
+cmake --build --preset windows-x64
+```
+
+## License
+
+OBS Replays is licensed under the [GNU General Public License v2](https://github.com/papesgit/obs-replays/blob/main/LICENSE).
