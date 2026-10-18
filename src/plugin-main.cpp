@@ -202,6 +202,7 @@ constexpr const char *playback_source_id = "obs_replays_channel_a";
 QWidget *replay_dock = nullptr;
 QWidget *capture_settings_group = nullptr;
 QComboBox *source_selector = nullptr;
+QComboBox *audio_source_selector = nullptr;
 QLineEdit *replay_folder_selector = nullptr;
 QPushButton *choose_replay_folder_button = nullptr;
 QSpinBox *video_bitrate_selector = nullptr;
@@ -300,6 +301,8 @@ void write_websocket_session(obs_data_t *data)
 	set_websocket_string(data, "folder", replay_session->sessionDirectory());
 	set_websocket_string(data, "sourceName", configuration.sourceName);
 	set_websocket_string(data, "sourceUuid", configuration.sourceUuid);
+	set_websocket_string(data, "audioSourceName", configuration.audioSourceName);
+	set_websocket_string(data, "audioSourceUuid", configuration.audioSourceUuid);
 	obs_data_set_bool(data, "recording", replay_session->isActive());
 	set_websocket_string(data, "activeTakeId", replay_session->activeTakeId().toString(QUuid::WithoutBraces));
 	obs_data_set_int(data, "recordedThroughMs", replay_session->latestTimelineUs() / 1000);
@@ -600,8 +603,12 @@ qint64 stinger_transition_point_milliseconds(obs_source_t *transition)
 bool add_source_to_selector(void *, obs_source_t *source)
 {
 	const char *name = obs_source_get_name(source);
-	if (name && *name)
+	if (name && *name) {
 		source_selector->addItem(QString::fromUtf8(name));
+		if (obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO)
+			audio_source_selector->addItem(QString::fromUtf8(name),
+						       QString::fromUtf8(obs_source_get_uuid(source)));
+	}
 	return true;
 }
 
@@ -610,12 +617,25 @@ void refresh_source_selector()
 	if (!source_selector)
 		return;
 
+	const QSignalBlocker source_blocker(source_selector);
+	const QSignalBlocker audio_blocker(audio_source_selector);
 	const QString selected_source = source_selector->currentText();
+	const QString selected_audio_uuid = audio_source_selector->currentData().toString();
+	const QString selected_audio_name = audio_source_selector->currentText();
+	audio_source_selector->clear();
+	audio_source_selector->addItem("Same as replay source", QString());
 	source_selector->clear();
 	obs_enum_sources(add_source_to_selector, nullptr);
 	const int selected_index = source_selector->findText(selected_source);
 	if (selected_index >= 0)
 		source_selector->setCurrentIndex(selected_index);
+	int audio_index = audio_source_selector->findData(selected_audio_uuid);
+	if (audio_index < 0 && !selected_audio_uuid.isEmpty()) {
+		// Preserve missing explicit selections so capture cannot silently switch sources.
+		audio_source_selector->addItem(selected_audio_name, selected_audio_uuid);
+		audio_index = audio_source_selector->count() - 1;
+	}
+	audio_source_selector->setCurrentIndex(audio_index >= 0 ? audio_index : 0);
 }
 
 void populate_frontend_source_selector(QComboBox *selector, void (*populate)(obs_frontend_source_list *))
@@ -807,6 +827,8 @@ obs_data_t *get_scene_collection_settings(obs_data_t *settings, bool create)
 
 void load_settings()
 {
+	const QSignalBlocker audio_source_blocker(audio_source_selector);
+	audio_source_selector->setCurrentIndex(0);
 	char *path = obs_module_config_path(settings_filename);
 	if (!path)
 		return;
@@ -839,6 +861,14 @@ void load_settings()
 	};
 
 	select_saved_value(source_selector, obs_data_get_string(collection_settings, "source"));
+	const QString audio_uuid = QString::fromUtf8(obs_data_get_string(collection_settings, "audio_source_uuid"));
+	int audio_index = audio_source_selector->findData(audio_uuid);
+	if (audio_index < 0 && !audio_uuid.isEmpty()) {
+		audio_source_selector->addItem(
+			QString::fromUtf8(obs_data_get_string(collection_settings, "audio_source")), audio_uuid);
+		audio_index = audio_source_selector->count() - 1;
+	}
+	audio_source_selector->setCurrentIndex(audio_index >= 0 ? audio_index : 0);
 	replay_folder_selector->setText(QString::fromUtf8(obs_data_get_string(collection_settings, "replay_folder")));
 	const int video_bitrate = (int)obs_data_get_int(collection_settings, "video_bitrate_mbps");
 	const int audio_bitrate = (int)obs_data_get_int(collection_settings, "audio_bitrate_kbps");
@@ -896,6 +926,9 @@ void save_settings()
 		obs_data_set_string(collection_settings, key, value.constData());
 	};
 	set_selector("source", source_selector);
+	set_selector("audio_source", audio_source_selector);
+	obs_data_set_string(collection_settings, "audio_source_uuid",
+			    audio_source_selector->currentData().toString().toUtf8().constData());
 	const QByteArray replay_folder = replay_folder_selector->text().toUtf8();
 	obs_data_set_string(collection_settings, "replay_folder", replay_folder.constData());
 	obs_data_set_int(collection_settings, "video_bitrate_mbps", video_bitrate_selector->value());
@@ -1160,6 +1193,18 @@ void start_recording_session()
 		return;
 	}
 
+	const QByteArray audio_uuid = audio_source_selector->currentData().toString().toUtf8();
+	obs_source_t *audio_source = audio_uuid.isEmpty() ? obs_source_get_ref(source)
+							  : obs_get_source_by_uuid(audio_uuid.constData());
+	if (!audio_source ||
+	    (!audio_uuid.isEmpty() && !(obs_source_get_output_flags(audio_source) & OBS_SOURCE_AUDIO))) {
+		obs_source_release(audio_source);
+		obs_source_release(source);
+		recording_status->setText(
+			"The selected replay audio source is unavailable. Select an audio source or use Same as replay source.");
+		return;
+	}
+
 	const QByteArray replay_folder = replay_folder_selector->text().toUtf8();
 	const char *source_name = obs_source_get_name(source);
 	const char *source_uuid = obs_source_get_uuid(source);
@@ -1167,6 +1212,8 @@ void start_recording_session()
 	configuration.replayFolder = QString::fromUtf8(replay_folder);
 	configuration.sourceName = QString::fromUtf8(source_name ? source_name : "");
 	configuration.sourceUuid = QString::fromUtf8(source_uuid ? source_uuid : "");
+	configuration.audioSourceName = QString::fromUtf8(obs_source_get_name(audio_source));
+	configuration.audioSourceUuid = QString::fromUtf8(obs_source_get_uuid(audio_source));
 	configuration.videoBitrateMbps = video_bitrate_selector->value();
 	configuration.audioBitrateKbps = audio_bitrate_selector->value();
 	if (replay_session && !replay_session->isActive()) {
@@ -1182,6 +1229,7 @@ void start_recording_session()
 	auto *session = replay_session ? replay_session.get() : new_session.get();
 	QString error;
 	if (!session || !session->start(configuration, &error)) {
+		obs_source_release(audio_source);
 		obs_source_release(source);
 		recording_status->setText(error);
 		return;
@@ -1189,12 +1237,14 @@ void start_recording_session()
 
 	auto capture = std::make_unique<obs_replays::SourceCapture>();
 	const char *capture_error = nullptr;
-	if (!capture->start(source, &capture_error)) {
+	if (!capture->start(source, audio_source, &capture_error)) {
+		obs_source_release(audio_source);
 		obs_source_release(source);
 		session->stop(&error);
 		recording_status->setText(QString::fromUtf8(capture_error));
 		return;
 	}
+	obs_source_release(audio_source);
 	obs_source_release(source);
 
 	auto writer = std::make_unique<obs_replays::SegmentWriter>();
@@ -2159,6 +2209,10 @@ QWidget *create_replay_dock()
 	auto *capture_form = new QFormLayout(capture_group);
 	source_selector = new QComboBox(capture_group);
 	capture_form->addRow("Source", source_selector);
+	audio_source_selector = new QComboBox(capture_group);
+	audio_source_selector->setToolTip(
+		"For a group containing game capture and a HUD, select the game capture here to record its audio.");
+	capture_form->addRow("Audio source", audio_source_selector);
 
 	auto *replay_folder_row = new QWidget(capture_group);
 	auto *replay_folder_layout = new QHBoxLayout(replay_folder_row);
@@ -2402,6 +2456,8 @@ QWidget *create_replay_dock()
 	QObject::connect(settings_save_timer, &QTimer::timeout, []() { save_settings(); });
 	QObject::connect(source_selector, &QComboBox::currentTextChanged,
 			 [](const QString &) { schedule_settings_save(); });
+	QObject::connect(audio_source_selector, QOverload<int>::of(&QComboBox::currentIndexChanged),
+			 [](int) { schedule_settings_save(); });
 	QObject::connect(replay_folder_selector, &QLineEdit::textChanged,
 			 [](const QString &) { schedule_settings_save(); });
 	auto save_spinbox = [](QSpinBox *selector) {
@@ -2491,6 +2547,7 @@ void obs_module_unload(void)
 	replay_dock = nullptr;
 	capture_settings_group = nullptr;
 	source_selector = nullptr;
+	audio_source_selector = nullptr;
 	replay_folder_selector = nullptr;
 	choose_replay_folder_button = nullptr;
 	video_bitrate_selector = nullptr;

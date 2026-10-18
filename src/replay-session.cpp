@@ -27,6 +27,7 @@ QJsonObject toJson(const ReplayTake &take)
 	return {{"id", take.id.toString(QUuid::WithoutBraces)},
 		{"path", take.recordingRelativePath},
 		{"source", QJsonObject{{"name", take.sourceName}, {"uuid", take.sourceUuid}}},
+		{"audioSource", QJsonObject{{"name", take.audioSourceName}, {"uuid", take.audioSourceUuid}}},
 		{"durationUs", QString::number(take.durationUs)},
 		{"startedAtUtc", take.startedAtUtc.toString(Qt::ISODateWithMs)},
 		{"stoppedAtUtc", take.stoppedAtUtc.toString(Qt::ISODateWithMs)}};
@@ -68,6 +69,8 @@ bool ReplaySession::start(const SessionConfiguration &sessionConfiguration, QStr
 	take.recordingRelativePath = QString("takes/take-%1.mp4").arg(replayTakes.size() + 1, 3, 10, QLatin1Char('0'));
 	take.sourceName = sessionConfiguration.sourceName;
 	take.sourceUuid = sessionConfiguration.sourceUuid;
+	take.audioSourceName = sessionConfiguration.audioSourceName;
+	take.audioSourceUuid = sessionConfiguration.audioSourceUuid;
 	take.startedAtUtc = QDateTime::currentDateTimeUtc();
 	// The session retains the most recently used capture configuration for
 	// presentation and legacy manifests. Source identity itself is immutable on
@@ -256,6 +259,9 @@ bool ReplaySession::loadManifest(const QString &manifestPath, QString *error)
 	const QJsonObject source = root.value("source").toObject();
 	loadedConfiguration.sourceName = source.value("name").toString();
 	loadedConfiguration.sourceUuid = source.value("uuid").toString();
+	const QJsonObject audioSource = root.value("audioSource").toObject();
+	loadedConfiguration.audioSourceName = audioSource.value("name").toString(loadedConfiguration.sourceName);
+	loadedConfiguration.audioSourceUuid = audioSource.value("uuid").toString(loadedConfiguration.sourceUuid);
 	const QJsonObject encoding = root.value("encoding").toObject();
 	loadedConfiguration.videoBitrateMbps = encoding.value("videoBitrateMbps").toInt(25);
 	loadedConfiguration.audioBitrateKbps = encoding.value("audioBitrateKbps").toInt(160);
@@ -273,6 +279,9 @@ bool ReplaySession::loadManifest(const QString &manifestPath, QString *error)
 		const QJsonObject takeSource = object.value("source").toObject();
 		take.sourceName = takeSource.value("name").toString(loadedConfiguration.sourceName);
 		take.sourceUuid = takeSource.value("uuid").toString(loadedConfiguration.sourceUuid);
+		const QJsonObject takeAudioSource = object.value("audioSource").toObject();
+		take.audioSourceName = takeAudioSource.value("name").toString(take.sourceName);
+		take.audioSourceUuid = takeAudioSource.value("uuid").toString(take.sourceUuid);
 		loadedTakes.append(take);
 	}
 	QList<ReplayEvent> loadedEvents;
@@ -332,18 +341,20 @@ bool ReplaySession::saveManifest(QString *error) const
 	QJsonArray takeArray;
 	for (const ReplayTake &take : replayTakes)
 		takeArray.append(toJson(take));
-	QJsonObject root{{"schemaVersion", 2},
-			 {"id", id},
-			 {"status", active ? "recording" : "stopped"},
-			 {"startedAtUtc", startedAtUtc.toString(Qt::ISODateWithMs)},
-			 {"stoppedAtUtc", stoppedAtUtc.toString(Qt::ISODateWithMs)},
-			 {"source",
-			  QJsonObject{{"name", configuration.sourceName}, {"uuid", configuration.sourceUuid}}},
-			 {"encoding", QJsonObject{{"container", "mp4"},
-						  {"videoBitrateMbps", configuration.videoBitrateMbps},
-						  {"audioBitrateKbps", configuration.audioBitrateKbps}}},
-			 {"takes", takeArray},
-			 {"events", eventArray}};
+	QJsonObject root{
+		{"schemaVersion", 2},
+		{"id", id},
+		{"status", active ? "recording" : "stopped"},
+		{"startedAtUtc", startedAtUtc.toString(Qt::ISODateWithMs)},
+		{"stoppedAtUtc", stoppedAtUtc.toString(Qt::ISODateWithMs)},
+		{"source", QJsonObject{{"name", configuration.sourceName}, {"uuid", configuration.sourceUuid}}},
+		{"audioSource",
+		 QJsonObject{{"name", configuration.audioSourceName}, {"uuid", configuration.audioSourceUuid}}},
+		{"encoding", QJsonObject{{"container", "mp4"},
+					 {"videoBitrateMbps", configuration.videoBitrateMbps},
+					 {"audioBitrateKbps", configuration.audioBitrateKbps}}},
+		{"takes", takeArray},
+		{"events", eventArray}};
 	QSaveFile file(QDir(directory).filePath("session.json"));
 	if (!file.open(QIODevice::WriteOnly)) {
 		*error = "Could not open the replay session manifest for writing.";

@@ -25,7 +25,7 @@ class SourceCapture {
 public:
 	~SourceCapture();
 
-	bool start(obs_source_t *source, const char **error);
+	bool start(obs_source_t *source, obs_source_t *audioSource, const char **error);
 	void stop();
 
 	bool isActive() const;
@@ -38,6 +38,7 @@ public:
 private:
 	struct AudioBlock {
 		uint64_t timestampNs = 0;
+		bool discontinuity = true;
 		uint32_t frames = 0;
 		uint32_t offset = 0;
 		QList<QByteArray> planes;
@@ -45,10 +46,12 @@ private:
 
 	static void onVideoFrame(void *param, struct video_data *frame);
 	static void onAudioFrame(void *param, obs_source_t *source, const struct audio_data *audioData, bool muted);
+	void enqueueAudio(obs_source_t *source, const struct audio_data *audioData, bool muted, uint64_t nowNs);
 	static bool provideAudio(void *param, uint64_t startTs, uint64_t endTs, uint64_t *newTs, uint32_t activeMixers,
 				 struct audio_output_data *mixes);
 
 	obs_source_t *source = nullptr;
+	obs_source_t *audioSource = nullptr;
 	obs_view_t *view = nullptr;
 	video_t *video = nullptr;
 	audio_t *audio = nullptr;
@@ -61,15 +64,14 @@ private:
 	bool audioClockInitialized = false;
 	int64_t audioTimestampOffsetNs = 0;
 	uint64_t nextRawAudioTimestampNs = 0;
-	bool audioOutputStarted = false;
-	uint64_t audioPrimingStartedNs = 0;
-	uint64_t audioOutputTimestampNs = 0;
+	uint64_t nextAudioTimestampNs = 0;
+	int64_t lastAudioSyncOffsetNs = 0;
+	bool audioStreamStarted = false;
+	double audioReadFraction = 0.0;
+	double audioRateRatio = 1.0;
+	double audioPhaseErrorFrames = 0.0;
 	uint64_t lastAudioArrivalNs = 0;
 	bool audioUnderrunDiagnosticPending = false;
-	uint32_t audioTargetQueueFrames = 0;
-	double audioReadFraction = 0.0;
-	double audioQueueErrorFrames = 0.0;
-	double audioRateRatio = 1.0;
 	uint64_t lastAudioDiagnosticNs = 0;
 	std::atomic<uint64_t> firstVideoTimestampNs = 0;
 	std::atomic<uint64_t> lastVideoTimestampNs = 0;

@@ -38,6 +38,8 @@ Returns `protocolVersion: 1` and `available`. When available, it also returns:
   "folder": "D:/Videos/OBS/replays/OBS-Replay-...",
   "sourceName": "Game Capture",
   "sourceUuid": "source-uuid",
+  "audioSourceName": "Game Capture",
+  "audioSourceUuid": "audio-source-uuid",
   "recording": true,
   "activeTakeId": "take-uuid",
   "recordedThroughMs": 125400,
@@ -46,7 +48,7 @@ Returns `protocolVersion: 1` and `available`. When available, it also returns:
 }
 ```
 
-`activeTakeId` is empty while stopped. `recordedThroughMs` is the active take duration while recording, otherwise the last recorded live position.
+`activeTakeId` is empty while stopped. `recordedThroughMs` is the active take duration while recording, otherwise the last recorded live position. `audioSourceName` and `audioSourceUuid` identify the audio source used for the most recent take; older session manifests default these to the video source.
 
 ### `GetRecordingStatus`
 

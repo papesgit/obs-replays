@@ -7,6 +7,7 @@ This project is currently in early development. Test it with your own sources an
 ## Features
 
 - Continuous recording of one OBS source with configurable video and audio bitrates
+- Optional separate audio source
 - Buttons for marking the previous 1, 2, 3, 5, or 10 seconds as an event
 - Editable event in/out times and labels
 - Playback of one or multiple selected events
@@ -48,7 +49,7 @@ The current release is built and tested on Windows. Other platforms are not curr
 6. Select one or more events in the table and click **Play selected events**.
 7. Click the same button during playout to stop and run the configured outro transition.
 
-The plugin creates an **OBS Replays Channel A** source in the selected replay scene when needed. Recording keeps the selected capture source active even when it is not part of the current Program scene.
+The plugin creates an **OBS Replays Channel A** source in the selected replay scene when needed. Recording keeps the selected capture sources active even when it is not part of the current Program scene.
 
 Replay recordings can use substantial disk space. The dock displays an estimate based on the selected bitrates and available storage.
 

@@ -13,6 +13,8 @@ struct SessionConfiguration {
 	QString replayFolder;
 	QString sourceName;
 	QString sourceUuid;
+	QString audioSourceName;
+	QString audioSourceUuid;
 	int videoBitrateMbps = 25;
 	int audioBitrateKbps = 160;
 };
@@ -31,6 +33,8 @@ struct ReplayTake {
 	QString recordingRelativePath;
 	QString sourceName;
 	QString sourceUuid;
+	QString audioSourceName;
+	QString audioSourceUuid;
 	TimelineUs durationUs = 0;
 	QDateTime startedAtUtc;
 	QDateTime stoppedAtUtc;
