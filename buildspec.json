@@ -41,7 +41,7 @@
     },
     "name": "obs-replays",
     "displayName": "OBS Replays",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "author": "papesgit",
     "website": "https://github.com/papesgit/obs-replays",
     "email": ""
